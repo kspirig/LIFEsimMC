@@ -75,6 +75,14 @@ class PlanetParams:
     sed_err_high: Tensor = None
     covariance: Tensor = None
 
+    radius: float = None
+    radius_err_low: float = None
+    radius_err_high: float = None
+    temp: float = None
+    temp_err_low: float = None
+    temp_err_high: float = None
+
+
 
 @dataclass
 class PlanetParamsResource(BaseResource):

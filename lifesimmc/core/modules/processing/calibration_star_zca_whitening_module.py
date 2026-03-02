@@ -1,4 +1,4 @@
-from copy import copy
+from copy import deepcopy, copy
 from itertools import product
 
 import numpy as np
@@ -126,7 +126,7 @@ class CalibrationStarZCAWhiteningModule(BaseTransformationModule):
         phringe.set(config_in.observation)
 
         # Remove all planets from the scene to calculate covariance only on noise
-        scene_new = copy(config_in.scene)
+        scene_new = deepcopy(config_in.scene)
         for planet in config_in.scene.planets:
             scene_new.remove_source(planet.name)
         phringe.set(scene_new)
