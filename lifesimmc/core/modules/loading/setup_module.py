@@ -189,6 +189,8 @@ class SetupModule(BaseModule):
                 argument_of_periapsis=planet.argument_of_periapsis,
                 true_anomaly=planet.true_anomaly,
                 mass=planet.mass,
+                radius=planet.radius,
+                temp=planet.temperature,
             )
             r_planet_params_out.params.append(planet_params)
 

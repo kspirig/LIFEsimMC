@@ -8,7 +8,7 @@ from lifesimmc.core.resources.planet_params_resource import PlanetParamsResource
 from astropy import constants as const
 
 
-class MLParameterEstimationModule(BaseModule):
+class MLParameterEstimationModulewithOMestimation(BaseModule):
     """Class representation of a module that performs maximum likelihood estimation (MLE) of planet parameters.
 
     Parameters
@@ -109,7 +109,7 @@ class MLParameterEstimationModule(BaseModule):
         return optimum_flux_at_maximum, x_coord, y_coord
 
     def apply(self, resources: list[BaseResource]) -> PlanetParamsResource:
-        print('Performing numerical MLE...')
+        print('Performing numerical MLE with known orbital parameters...')
 
         r_config_in = self.get_resource_from_name(self.n_config_in)
         r_templates_in = self.get_resource_from_name(self.n_template_in)
@@ -132,18 +132,33 @@ class MLParameterEstimationModule(BaseModule):
         template_data = template_data.reshape((-1,) + template_data.shape[2:])
 
         # Set up parameters and initial conditions
-        if planet_params_in is None:
-            flux_init, posx_init, posy_init = self._get_analytical_initial_guess(
+        if planet_params_in is not None and len(planet_params_in.params) > 0:
+
+
+            semi_major_axis_init = planet_params_in.params[0].semi_major_axis
+            eccentricity_init = planet_params_in.params[0].eccentricity
+            planet_mass_fixed = planet_params_in.params[0].mass
+            inclination_init = planet_params_in.params[0].inclination
+            raan_init = planet_params_in.params[0].raan
+            argument_of_periapsis_init = planet_params_in.params[0].argument_of_periapsis
+            true_anomaly_init = planet_params_in.params[0].true_anomaly
+            flux_init, _ , _ = self._get_analytical_initial_guess(
                 data_in,
                 template_data,
                 grid_coordinates
             )
-        # If planet_params_in is provided, use its values as initial conditions
         else:
-            # TODO: implement for multiple planets
+            radius_init = 6 * 1e6  # 1 Earth radius in meters
+            temp_init = 300.0  # Kelvin
+            semi_major_axis_init = 1 * const.au.value  # Can we evaluate quite good?
+            eccentricity_init = 0.0
+            planet_mass_fixed = 1 * const.M_earth.value
+            inclination_init = np.pi / 2
+            raan_init = np.pi
+            argument_of_periapsis_init = np.pi
+            true_anomaly_init = 0
             flux_init = planet_params_in.params[0].sed.cpu().numpy()
-            posx_init = planet_params_in.params[0].pos_x
-            posy_init = planet_params_in.params[0].pos_y
+
 
         data_in = data_in.cpu().numpy()
         hfov_max = r_config_in.phringe.get_field_of_view()[-1].cpu().numpy() / 2  # TODO: /14 Check this
@@ -155,19 +170,25 @@ class MLParameterEstimationModule(BaseModule):
                 params.add(f'flux_{j}', value=flux_init[j], min=0)
             else:
                 params.add(f'flux_{j}', value=flux_init[j])
-        params.add('pos_x', value=posx_init, min=-hfov_max, max=hfov_max)
-        params.add('pos_y', value=posy_init, min=-hfov_max, max=hfov_max)
 
         # Perform MLE
         def residual_data(params, target):
-            posx = params['pos_x'].value
-            posy = params['pos_y'].value
+
             flux = np.array([params[f'flux_{z}'].value for z in range(len(flux_init))])
+
             model = r_config_in.phringe.get_model_counts(
+                kernels=True,
                 spectral_energy_distribution=flux,
-                x_position=posx,
-                y_position=posy,
-                kernels=True
+                semi_major_axis=semi_major_axis_init,
+                eccentricity=eccentricity_init,
+                inclination=inclination_init,
+                raan=raan_init,
+                argument_of_periapsis=argument_of_periapsis_init,
+                true_anomaly=true_anomaly_init,
+
+                host_star_distance=r_config_in.scene.star.distance,
+                host_star_mass=r_config_in.scene.star.mass,
+                planet_mass=planet_mass_fixed
             )
             model = transf(model)
             model = np.transpose(model, (0, 2, 1))
@@ -179,18 +200,15 @@ class MLParameterEstimationModule(BaseModule):
         cov_out = out.covar
 
         fluxes = np.array([out.params[f'flux_{k}'].value for k in range(len(flux_init))])
-        posx = out.params['pos_x'].value
-        posy = out.params['pos_y'].value
+
 
         try:
             stds = np.sqrt(np.diag(cov_out))
-            flux_err = stds[0:-2]
-            posx_err = stds[-2]
-            posy_err = stds[-1]
+            flux_err = stds
+
         except ValueError:
             flux_err = np.full_like(fluxes, np.nan)
-            posx_err = np.nan
-            posy_err = np.nan
+
 
         # TODO: Implement multi-planet signal extraction
         r_planet_params_out = PlanetParamsResource(
@@ -203,12 +221,6 @@ class MLParameterEstimationModule(BaseModule):
             sed=torch.tensor(fluxes),
             sed_err_low=torch.tensor(flux_err),
             sed_err_high=torch.tensor(flux_err),
-            pos_x=posx,
-            pos_y=posy,
-            pos_x_err_low=posx_err,
-            pos_x_err_high=posx_err,
-            pos_y_err_low=posy_err,
-            pos_y_err_high=posy_err,
             covariance=cov_out
         )
         r_planet_params_out.params.append(planet_params)

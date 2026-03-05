@@ -2,11 +2,15 @@ import numpy as np
 import torch
 from lmfit import minimize, Parameters
 from astropy import units as u
+from astropy import constants as const
+from pathlib import Path
+from datetime import datetime
 
 from lifesimmc.core.modules.base_module import BaseModule
 from lifesimmc.core.resources.base_resource import BaseResource
 from lifesimmc.core.resources.planet_params_resource import PlanetParamsResource, PlanetParams
-
+from phringe.util.spectrum import get_blackbody_spectrum_standard_units
+import matplotlib.pyplot as plt
 
 class MLBBParameterEstimationModule(BaseModule):
     """Class representation of a module that performs maximum likelihood estimation (MLE) of planet parameters.
@@ -118,18 +122,15 @@ class MLBBParameterEstimationModule(BaseModule):
         transf = r_transformation_in.transformation if r_transformation_in else lambda x: x
         planet_params_in = self.get_resource_from_name(self.n_planet_params_in) if self.n_planet_params_in else None
 
-        print("Planet params in: ", planet_params_in.params if planet_params_in is not None else None)
 
         distance = r_config_in.scene.star.distance  # float in meters
-        print("Distance: ", distance)
 
 
 
         times = r_config_in.phringe.get_time_steps().cpu().numpy()
         wavelengths = r_config_in.phringe.get_wavelength_bin_centers().cpu().numpy()
         wavelength_bin_widths = r_config_in.phringe.get_wavelength_bin_widths().cpu().numpy()
-        print("Wavelength min/max:", np.min(wavelengths), np.max(wavelengths))
-        print("Wavelength width min/max:", np.min(wavelength_bin_widths), np.max(wavelength_bin_widths))
+
         data_in = self.get_resource_from_name(self.n_data_in).get_data()
         template_data = r_templates_in.get_data()
         grid_coordinates = r_templates_in.grid_coordinates
@@ -141,28 +142,23 @@ class MLBBParameterEstimationModule(BaseModule):
         template_data = template_data.reshape((-1,) + template_data.shape[2:])
 
         # Set up parameters and initial conditions
-        if planet_params_in is None:
-            #ToDO: Change the analytical aswell
-            flux_init, posx_init, posy_init = self._get_analytical_initial_guess(
+        if planet_params_in is not None and len(planet_params_in.params) > 0:
+            radius_init = planet_params_in.params[0].radius
+            temp_init = planet_params_in.params[0].temp
+        else:
+            radius_init = 6 * 1e6  # 1 Earth radius in meters
+            temp_init = 300.0      # Kelvin
+
+
+        _, posx_init, posy_init = self._get_analytical_initial_guess(
                 data_in,
                 template_data,
                 grid_coordinates
             )
-        # If planet_params_in is provided, use its values as initial conditions
-        else:
-            # TODO: implement for multiple planets
 
-            print(r_config_in.scene)  # ToDo: Get Radius and Temperature from somewhere
-            if len(r_config_in.scene.planets) > 0:
-                radius_init = r_config_in.scene.planets[0].radius
-                temp_init = r_config_in.scene.planets[0].temperature
-            else:
-                radius_init = 6 * 1e6  # 1 Earth radius in meters
-                temp_init = 300.0      # Kelvin
-            print("Radius init",radius_init)
-            print("Temperature init: ", temp_init)
-            posx_init = planet_params_in.params[0].pos_x
-            posy_init = planet_params_in.params[0].pos_y
+
+        print("Radius init", radius_init)
+        print("Temperature init:", temp_init)
 
         data_in = data_in.cpu().numpy()
         hfov_max = r_config_in.phringe.get_field_of_view()[-1].cpu().numpy() / 2  # TODO: /14 Check this
@@ -172,26 +168,35 @@ class MLBBParameterEstimationModule(BaseModule):
 
         params.add('pos_x', value=posx_init, min=-hfov_max, max=hfov_max)
         params.add('pos_y', value=posy_init, min=-hfov_max, max=hfov_max)
-        params.add("temp",value = temp_init,min = 0,max = 1e4)
-        params.add("radius",value = radius_init,min = 0,max = 1e9)
+        params.add("temp",value = temp_init,min = 50,max = 1e4)
+        params.add("radius",value = radius_init,min = 5*1e4,max = 1e9)
 
-        from astropy import constants as const
-        _bb_debug_printed = False
 
-        def Blackbody(radius,temp,wavelengths):
-            lam_m = np.asarray(wavelengths, dtype=float)
-            x = (const.h.value * const.c.value) / (lam_m * const.k_B.value * temp)
-            denom = np.expm1(x)
-            photon_flux_per_m = (2.0 * np.pi * const.c.value / lam_m ** 4) * (radius / distance) ** 2 / denom
-            return photon_flux_per_m
+
+        OUTPUT_DIR = Path('bb_resultsGridSize40PPHRINGE')
+        plots_dir = OUTPUT_DIR / "mlbb_parameter_estimation_plots"
+
+
+        eval_counter = 0
+
+
         # Perform MLE
         def residual_data(params, target):
+            nonlocal eval_counter
+            eval_counter += 1
             posx = params['pos_x'].value
             posy = params['pos_y'].value
+            temp = params['temp'].value
 
             #ToDo: Inlcude fitting Orbital Motion
 
-            flux = Blackbody(radius=params['radius'].value, temp=params['temp'].value, wavelengths=wavelengths)
+            flux = np.pi * get_blackbody_spectrum_standard_units(temperature=temp, wavelengths=wavelengths) * (params['radius'].value / distance) ** 2
+
+
+
+            if torch.is_tensor(flux):
+                flux = flux.detach().cpu().numpy()
+
 
             model = r_config_in.phringe.get_model_counts(
                 spectral_energy_distribution=flux,
@@ -199,23 +204,99 @@ class MLBBParameterEstimationModule(BaseModule):
                 y_position=posy,
                 kernels=True
             )
+
+
+
+            #
+            #
+            # # # Save loop diagnostics with unique names to avoid overwriting.
+            # try:
+            #     eval_name = f"eval_{eval_counter:06d}.png"
+            #     target_name = f"target_eval_{eval_counter:06d}.png"
+            #     flux_name = f"flux_eval_{eval_counter:06d}.png"
+            #
+            #
+            #     plt.figure(figsize=(7, 4.5))
+            #     plt.imshow(model[0], cmap='Greys', aspect='auto')
+            #     plt.title(f'Model (channel 0), eval={eval_counter}')
+            #     plt.ylabel('Wavelength Channel')
+            #     plt.xlabel('Time Step')
+            #     plt.colorbar()
+            #     plt.tight_layout()
+            #     plt.savefig(run_plots_dir / eval_name, dpi=150)
+            #     plt.close()
+            #
+            #
+            #
+            #     plt.figure(figsize=(7, 4.5))
+            #     plt.imshow(target.T, cmap='Greys', aspect='auto')
+            #     plt.title(f'Target (channel 0), eval={eval_counter}')
+            #     plt.ylabel('Wavelength Channel')
+            #     plt.xlabel('Time Step')
+            #     plt.colorbar()
+            #     plt.tight_layout()
+            #     plt.savefig(run_plots_dir / target_name, dpi=150)
+            #     plt.close()
+            #
+            #     print(temp, " ", params["radius"].value)
+            #
+            #     plt.figure(figsize=(7, 4.5))
+            #     plt.plot(
+            #         wavelengths,
+            #         flux,
+            #         label=f"T={temp:.3f} K, R={params['radius'].value:.3e} m"
+            #     )
+            #     plt.title(f'Flux, eval={eval_counter}')
+            #     plt.xlabel('Wavelength [m]')
+            #     plt.ylabel('Flux')
+            #     plt.legend()
+            #     plt.tight_layout()
+            #     plt.savefig(run_plots_dir / flux_name, dpi=150)
+            #     plt.close()
+            #
+            #
+            #
+            # except Exception as exc:
+            #     print(f"Could not save loop plots at eval {eval_counter}")
+
             model = transf(model)
             model = np.transpose(model, (0, 2, 1))
             model = model.reshape(data_in.shape)
 
-            residual = model - target
-            if not np.all(np.isfinite(residual)):
-                print("Non-finite residual detected")
-            return residual
+            return model - target
+
+
+        # out = minimize(
+        #     residual_data,
+        #     params,
+        #     args=(data_in,),
+        #     method="least_squares",
+        #     max_nfev=20000,
+        #     ftol=1e-10,
+        #     xtol=None,
+        #     gtol=1e-10,
+        #     loss="soft_l1",
+        #     f_scale=1.0,
+        #     x_scale="jac",
+        #     nan_policy="omit",
+        # )
 
         out = minimize(residual_data, params, args=(data_in,), method='leastsq')
+
         print("success:", out.success)
         print("message:", out.message)
         print("nfev:", out.nfev)
         print("chisqr:", out.chisqr)
         cov_out = out.covar
 
-        fluxes = Blackbody(radius=out.params['radius'].value, temp=out.params['temp'].value, wavelengths=wavelengths)
+        fluxes = np.pi* get_blackbody_spectrum_standard_units(
+            temperature=out.params['temp'].value,
+            wavelengths=wavelengths
+        ) * (out.params['radius'].value / distance) ** 2
+
+        if torch.is_tensor(fluxes):
+            fluxes = fluxes.detach().cpu().numpy()
+
         posx = out.params['pos_x'].value
         posy = out.params['pos_y'].value
 
@@ -233,17 +314,19 @@ class MLBBParameterEstimationModule(BaseModule):
             photon_flux_per_m = (2.0 * np.pi * const.c.value / lam_m ** 4) * 2*(radius / (distance**2)) / denom
             return photon_flux_per_m
 
-        # after fluxes is computed
+        # Extract parameter errors by name so covariance ordering cannot corrupt uncertainties.
         try:
             stds = np.sqrt(np.diag(cov_out))
-            temp_err = stds[0]
-            radius_err = stds[1]
-            posx_err = stds[2]
-            posy_err = stds[3]
+            var_names = out.var_names if out.var_names is not None else []
+            idx_map = {name: i for i, name in enumerate(var_names)}
 
-            # No direct per-wavelength covariance from this fit -> use NaN vector
+            temp_err = stds[idx_map['temp']] if 'temp' in idx_map else np.nan
+            radius_err = stds[idx_map['radius']] if 'radius' in idx_map else np.nan
+            posx_err = stds[idx_map['pos_x']] if 'pos_x' in idx_map else np.nan
+            posy_err = stds[idx_map['pos_y']] if 'pos_y' in idx_map else np.nan
+
             flux_err = np.sqrt(dBdT(radius,temp,wavelengths) ** 2  * temp_err**2 + dBdR(radius,temp,wavelengths) ** 2  * radius_err**2)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, KeyError, IndexError):
             flux_err = np.full_like(fluxes, np.nan, dtype=float)
             posx_err = np.nan
             posy_err = np.nan
@@ -277,7 +360,7 @@ class MLBBParameterEstimationModule(BaseModule):
 
         )
         r_planet_params_out.params.append(planet_params)
-        print("Fitted Temperature", out.params['temp'].value)
+        print("Fitted Temperature", temp)
         print("Fitted Radius", out.params['radius'].value)
         print('Done')
         return r_planet_params_out
