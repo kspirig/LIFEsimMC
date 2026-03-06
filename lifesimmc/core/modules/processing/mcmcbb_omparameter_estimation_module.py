@@ -3,8 +3,14 @@ import torch
 from lmfit import minimize, Parameters
 from pathlib import Path
 from typing import Optional
+from typing import Any, Callable
+import json
+import platform
+import sys
 from datetime import datetime
 from uuid import uuid4
+from dataclasses import dataclass
+from multiprocessing.dummy import Pool as ThreadPool
 
 from lifesimmc.core.modules.base_module import BaseModule
 from lifesimmc.core.resources.base_resource import BaseResource
@@ -13,6 +19,159 @@ from astropy import constants as const
 from phringe.util.spectrum import get_blackbody_spectrum_standard_units
 
 import astropy.units as u
+
+
+@dataclass
+class _MCMCResidualContext:
+    r_config_in: Any
+    wavelengths: np.ndarray
+    distance: float
+    transf: Callable[[Any], Any]
+    data_shape: tuple
+    model_transpose_axes: tuple
+    planet_mass_fixed: float
+    sigma_in: Optional[np.ndarray]
+    use_poisson_likelihood: bool
+
+
+_MCMC_RESIDUAL_CONTEXT: Optional[_MCMCResidualContext] = None
+_MCMC_EVAL_COUNTER = 0
+_MCMC_ORBITAL_FAILURE_PRINTED = False
+_MCMC_LOG_EVERY = 200
+
+
+def _identity(x):
+    return x
+
+
+def _pow10(x: float) -> float:
+    return float(np.power(10.0, x))
+
+
+def _json_default(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+
+
+def _snapshot_resource(resource: Any) -> dict:
+    snapshot = {}
+    if resource is None:
+        return snapshot
+
+    for key, value in vars(resource).items():
+        if key.startswith("_") or callable(value):
+            continue
+        if isinstance(value, (str, int, float, bool, type(None))):
+            snapshot[key] = value
+        elif isinstance(value, np.ndarray):
+            snapshot[f"{key}_shape"] = list(value.shape)
+            snapshot[f"{key}_dtype"] = str(value.dtype)
+        elif isinstance(value, torch.Tensor):
+            snapshot[f"{key}_shape"] = list(value.shape)
+            snapshot[f"{key}_dtype"] = str(value.dtype)
+        elif isinstance(value, (list, tuple)) and len(value) <= 20:
+            if all(isinstance(item, (str, int, float, bool, type(None))) for item in value):
+                snapshot[key] = list(value)
+            else:
+                snapshot[key] = f"{type(value).__name__}(len={len(value)})"
+        elif isinstance(value, dict):
+            small = {}
+            for k, v in value.items():
+                if isinstance(v, (str, int, float, bool, type(None))):
+                    small[str(k)] = v
+                else:
+                    small[str(k)] = str(type(v))
+            snapshot[key] = small
+        else:
+            snapshot[key] = str(type(value))
+    return snapshot
+
+
+def _residual_data_emcee(params, target):
+    global _MCMC_EVAL_COUNTER, _MCMC_ORBITAL_FAILURE_PRINTED
+    ctx = _MCMC_RESIDUAL_CONTEXT
+    if ctx is None:
+        raise RuntimeError("MCMC residual context not set.")
+
+    _MCMC_EVAL_COUNTER += 1
+
+    two_pi = 2.0 * np.pi
+    temp = _pow10(params["log_temp"].value)
+    radius = _pow10(params["log_radius"].value)
+    semi_major_axis = _pow10(params["log_semi_major_axis"].value)
+    raan = float(np.mod(params["raan_raw"].value, two_pi))
+    argument_of_periapsis = float(np.mod(params["argument_of_periapsis_raw"].value, two_pi))
+    true_anomaly = float(np.mod(params["true_anomaly_raw"].value, two_pi))
+
+    if _MCMC_LOG_EVERY > 0 and _MCMC_EVAL_COUNTER % _MCMC_LOG_EVERY == 0:
+        print(
+            f"[Eval {_MCMC_EVAL_COUNTER}] "
+            f"T={temp:.6g}, R={radius:.6g}, "
+            f"a={semi_major_axis:.6g}, e={params['eccentricity'].value:.6g}, "
+            f"inc={params['inclination'].value:.6g}, raan={raan:.6g}, "
+            f"argp={argument_of_periapsis:.6g}, nu={true_anomaly:.6g}"
+        )
+
+    flux = np.pi * get_blackbody_spectrum_standard_units(
+        temperature=temp,
+        wavelengths=ctx.wavelengths,
+    ) * (radius / ctx.distance) ** 2
+    flux = flux.detach().cpu().numpy()
+
+    try:
+        model = ctx.r_config_in.phringe.get_model_counts(
+            kernels=True,
+            spectral_energy_distribution=flux,
+            semi_major_axis=semi_major_axis,
+            eccentricity=params["eccentricity"].value,
+            inclination=params["inclination"].value,
+            raan=raan,
+            argument_of_periapsis=argument_of_periapsis,
+            true_anomaly=true_anomaly,
+            host_star_distance=ctx.r_config_in.scene.star.distance,
+            host_star_mass=ctx.r_config_in.scene.star.mass,
+            planet_mass=ctx.planet_mass_fixed,
+        )
+    except (RuntimeError, ValueError, FloatingPointError) as exc:
+        if not _MCMC_ORBITAL_FAILURE_PRINTED:
+            print(f"Orbital model failed for trial parameters; continuing with penalty residual. {exc}")
+            _MCMC_ORBITAL_FAILURE_PRINTED = True
+        if ctx.use_poisson_likelihood:
+            return -1e100
+        return np.full_like(target, 1e30, dtype=float)
+
+    model = ctx.transf(model)
+    if isinstance(model, torch.Tensor):
+        model = model.detach().cpu().numpy()
+    else:
+        model = np.asarray(model)
+    model = np.transpose(model, ctx.model_transpose_axes).reshape(ctx.data_shape)
+
+    if ctx.use_poisson_likelihood:
+        model_safe = np.clip(model, 1e-12, None)
+        nll = np.sum(model_safe - target * np.log(model_safe))
+        return -float(nll)
+
+    if ctx.sigma_in is not None:
+        residual = (model - target) / ctx.sigma_in
+    else:
+        residual = model - target
+    if not np.all(np.isfinite(residual)):
+        print("Non-finite residual detected")
+    return residual
 
 class MCMCBBOMParameterEstimationModule(BaseModule):
     """Class representation of a module that performs maximum likelihood estimation (MLE) of planet parameters.
@@ -39,7 +198,8 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
             n_transformation_in: str = None,
             n_template_in: str = None,
             n_planet_params_in: str = None,
-            bounds: bool = False
+            bounds: bool = False,
+            n_cores: int = None
     ):
         """Constructor method.
 
@@ -64,15 +224,25 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
         self.n_planet_params_out = n_planet_params_out
         self.n_planet_params_in = n_planet_params_in
         self.bounds = bounds
+        self.n_cores = n_cores
 
     def apply(self, resources: list[BaseResource]) -> PlanetParamsResource:
         print('Performing numerical MLE with Blackbody and Orbital Motion...')
+        run_started_utc = datetime.utcnow()
         plot_run_id = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ')}_{uuid4().hex[:8]}"
+        output_root = Path.cwd() / "mcmcbb_om_runs"
+        run_dir = output_root / f"{self.n_planet_params_out}_{plot_run_id}"
+        plots_dir = run_dir / "plots"
+        arrays_dir = run_dir / "arrays"
+        tables_dir = run_dir / "tables"
+        for path in (run_dir, plots_dir, arrays_dir, tables_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        print(f"Saving MCMC artifacts to: {run_dir}")
 
         r_config_in = self.get_resource_from_name(self.n_config_in)
         r_transformation_in = self.get_resource_from_name(
             self.n_transformation_in) if self.n_transformation_in else None
-        transf = r_transformation_in.transformation if r_transformation_in else lambda x: x
+        transf = r_transformation_in.transformation if r_transformation_in else _identity
         planet_params_in = self.get_resource_from_name(self.n_planet_params_in) if self.n_planet_params_in else None
 
 
@@ -80,13 +250,22 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
 
 
 
-        times = r_config_in.phringe.get_time_steps().cpu().numpy()
-        wavelengths = r_config_in.phringe.get_wavelength_bin_centers().cpu().numpy()
-        wavelength_bin_widths = r_config_in.phringe.get_wavelength_bin_widths().cpu().numpy()
+        times_tensor = r_config_in.phringe.get_time_steps()
+        wavelengths_tensor = r_config_in.phringe.get_wavelength_bin_centers()
+        wavelength_bin_widths_tensor = r_config_in.phringe.get_wavelength_bin_widths()
+        times = times_tensor.cpu().numpy()
+        wavelengths = wavelengths_tensor.cpu().numpy()
+        wavelength_bin_widths = wavelength_bin_widths_tensor.cpu().numpy()
         print("Wavelength min/max:", np.min(wavelengths), np.max(wavelengths))
         print("Wavelength width min/max:", np.min(wavelength_bin_widths), np.max(wavelength_bin_widths))
         data_resource = self.get_resource_from_name(self.n_data_in)
         data_in = data_resource.get_data()
+        cuda_active = (
+            (isinstance(times_tensor, torch.Tensor) and times_tensor.is_cuda)
+            or (isinstance(wavelengths_tensor, torch.Tensor) and wavelengths_tensor.is_cuda)
+            or (isinstance(wavelength_bin_widths_tensor, torch.Tensor) and wavelength_bin_widths_tensor.is_cuda)
+            or (isinstance(data_in, torch.Tensor) and data_in.is_cuda)
+        )
 
         # Flatten data along differential outputs and times axes
         data_in = data_in.permute(0, 2, 1)
@@ -159,24 +338,32 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
             print("Likelihood mode: Gaussian with unit sigma.")
 
         params = Parameters()
+        two_pi = 2.0 * np.pi
+        log10 = np.log10
+        print("Sampling in log10-space for temp, radius, and semi_major_axis.")
 
+        params.add("log_temp", value=log10(temp_init), min=log10(50), max=log10(4000))
+        params.add("log_radius", value=log10(radius_init), min=log10(1e5), max=log10(2 * 1e8))
 
-
-
-        params.add("temp",value = temp_init,min = 50,max = 4000)
-        params.add("radius",value = radius_init,min = 1e5,max = 2*1e8)
-
-        params.add('semi_major_axis',value = semi_major_axis_init,min = 0.01 * const.au.value,max = 20*const.au.value)
+        params.add(
+            "log_semi_major_axis",
+            value=log10(semi_major_axis_init),
+            min=log10(0.01 * const.au.value),
+            max=log10(20 * const.au.value),
+        )
         params.add('eccentricity',value = eccentricity_init,min = 0,max = 0.5)
 
         params.add('inclination',value = inclination_init, min = 0 ,max = np.pi)
-        # Sample unconstrained angle variables and wrap to [0, 2pi) in the model.
-        params.add('raan_raw', value=raan_init)
-        params.add('argument_of_periapsis_raw', value=argument_of_periapsis_init)
-        params.add('true_anomaly_raw', value=true_anomaly_init)
+        # Keep angle parameters bounded so walker initialization can be uniform in [0, 2pi).
+        params.add('raan_raw', value=raan_init, min=0.0, max=two_pi)
+        params.add('argument_of_periapsis_raw', value=argument_of_periapsis_init, min=0.0, max=two_pi)
+        params.add('true_anomaly_raw', value=true_anomaly_init, min=0.0, max=two_pi)
 
         vary_names = [name for name, par in params.items() if par.vary]
         display_name_map = {
+            "log_temp": "log10(temp)",
+            "log_radius": "log10(radius)",
+            "log_semi_major_axis": "log10(semi_major_axis)",
             "raan_raw": "raan",
             "argument_of_periapsis_raw": "argument_of_periapsis",
             "true_anomaly_raw": "true_anomaly",
@@ -186,34 +373,28 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
         if ndim == 0:
             raise ValueError("No varying parameters configured for emcee.")
 
-        # Initialize walkers near the initial values for faster convergence.
-        rng = np.random.default_rng(12345)
+        print("Initializing MCMC walkers uniformly within parameter bounds.")
+        mcmc_seed = 12345
+        rng = np.random.default_rng(mcmc_seed)
         nwalkers = max(40, 2 * ndim + 8)
         p0 = np.zeros((nwalkers, ndim), dtype=float)
         for j, par in enumerate(varying_params):
             lo = par.min if par.min is not None else -np.inf
             hi = par.max if par.max is not None else np.inf
-            center = float(par.value)
-            cloud = center * (1.0 + 1e-2 * rng.normal(size=nwalkers))
-            if center == 0.0:
-                scale = 1e-6
-                if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-                    scale = max(scale, 1e-3 * (hi - lo))
-                cloud = center + scale * rng.normal(size=nwalkers)
-            p0[:, j] = cloud
-            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-                eps = 1e-12 * max(1.0, abs(lo), abs(hi))
-                p0[:, j] = np.clip(p0[:, j], lo + eps, hi - eps)
+            if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+                raise ValueError(
+                    f"Parameter '{vary_names[j]}' requires finite min/max bounds for uniform walker initialization."
+                )
+            eps = 1e-12 * max(1.0, abs(lo), abs(hi))
+            lo_safe = lo + eps
+            hi_safe = hi - eps
+            if hi_safe <= lo_safe:
+                lo_safe, hi_safe = lo, hi
+            p0[:, j] = rng.uniform(lo_safe, hi_safe, size=nwalkers)
 
-        # Final perturbation to avoid accidental duplicate walker rows.
-        p0 += rng.normal(0.0, 1e-10, size=p0.shape)
-
-
-
-        orbital_failure_printed = False
+        # Tiny perturbation to avoid accidental duplicate rows.
+        p0 += rng.normal(0.0, 1e-12, size=p0.shape)
         eval_counter = 0
-
-        two_pi = 2.0 * np.pi
 
         def _wrap_angle(x: float) -> float:
             return float(np.mod(x, two_pi))
@@ -255,70 +436,83 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
             model = np.transpose(model, model_transpose_axes).reshape(data_shape)
             return model, flux
 
-        # Perform MLE/MCMC objective evaluations
-        def residual_data(params, target):
-            nonlocal orbital_failure_printed, eval_counter
-            eval_counter += 1
-
-            raan = _wrap_angle(params['raan_raw'].value)
-            argument_of_periapsis = _wrap_angle(params['argument_of_periapsis_raw'].value)
-            true_anomaly = _wrap_angle(params['true_anomaly_raw'].value)
-
-            if eval_counter % 20 == 0:
-                print(
-                    f"[Eval {eval_counter}] "
-                    f"T={params['temp'].value:.6g}, R={params['radius'].value:.6g}, "
-                    f"a={params['semi_major_axis'].value:.6g}, e={params['eccentricity'].value:.6g}, "
-                    f"inc={params['inclination'].value:.6g}, raan={raan:.6g}, "
-                    f"argp={argument_of_periapsis:.6g}, nu={true_anomaly:.6g}"
-                )
-
-            try:
-                model, _ = _evaluate_model_numpy(
-                    temp=params['temp'].value,
-                    radius=params['radius'].value,
-                    semi_major_axis=params['semi_major_axis'].value,
-                    eccentricity=params['eccentricity'].value,
-                    inclination=params['inclination'].value,
-                    raan=raan,
-                    argument_of_periapsis=argument_of_periapsis,
-                    true_anomaly=true_anomaly,
-                )
-            except (RuntimeError, ValueError, FloatingPointError) as exc:
-                if not orbital_failure_printed:
-                    print(f"Orbital model failed for trial parameters; continuing with penalty residual. {exc}")
-                    orbital_failure_printed = True
-                if use_poisson_likelihood:
-                    return -1e100
-                return np.full_like(target, 1e30, dtype=float)
-
-            if use_poisson_likelihood:
-                # emcee expects log-posterior for scalar objective values.
-                model_safe = np.clip(model, 1e-12, None)
-                nll = np.sum(model_safe - target * np.log(model_safe))
-                return -float(nll)
-
-            if sigma_in is not None:
-                residual = (model - target) / sigma_in
-            else:
-                residual = model - target
-            if not np.all(np.isfinite(residual)):
-                print("Non-finite residual detected")
-            return residual
-
-        out = minimize(
-            residual_data,
-            params,
-            args=(data_in,),
-            method='emcee',
-            float_behavior='posterior',
-            nwalkers=nwalkers,
-            burn=300,
-            steps=2400,
-            thin=10,
-            pos=p0,
-            progress=True,
+        global _MCMC_RESIDUAL_CONTEXT, _MCMC_EVAL_COUNTER, _MCMC_ORBITAL_FAILURE_PRINTED
+        _MCMC_RESIDUAL_CONTEXT = _MCMCResidualContext(
+            r_config_in=r_config_in,
+            wavelengths=wavelengths,
+            distance=distance,
+            transf=transf,
+            data_shape=data_shape,
+            model_transpose_axes=model_transpose_axes,
+            planet_mass_fixed=planet_mass_fixed,
+            sigma_in=sigma_in,
+            use_poisson_likelihood=use_poisson_likelihood,
         )
+        _MCMC_EVAL_COUNTER = 0
+        _MCMC_ORBITAL_FAILURE_PRINTED = False
+
+        try:
+            requested_workers = int(self.n_cores) if self.n_cores is not None else 1
+            if requested_workers < 1:
+                requested_workers = 1
+
+            # emcee stretch moves update approximately half the walkers at a time.
+            max_useful_workers = max(1, nwalkers // 2)
+            worker_count = min(requested_workers, max_useful_workers)
+            if requested_workers > max_useful_workers:
+                print(
+                    f"MCMC parallelism: requested n_cores={requested_workers}, "
+                    f"capped to {worker_count} (nwalkers={nwalkers})."
+                )
+
+            if cuda_active and worker_count > 1:
+                print(
+                    "MCMC parallelism: CUDA detected; disabling thread pool "
+                    "because a shared GPU context is typically slower with Python threads."
+                )
+                worker_count = 1
+
+            if worker_count > 1:
+                print(
+                    f"CPU MCMC parallelism: running {worker_count} thread workers "
+                    f"(requested {requested_workers})."
+                )
+                with ThreadPool(processes=worker_count) as thread_pool:
+                    out = minimize(
+                        _residual_data_emcee,
+                        params,
+                        args=(data_in,),
+                        method='emcee',
+                        float_behavior='posterior',
+                        nwalkers=nwalkers,
+                        burn=300,
+                        steps=2400,
+                        thin=10,
+                        pos=p0,
+                        progress=True,
+                        workers=thread_pool,
+                    )
+            else:
+                print(
+                    f"MCMC parallelism: disabled (effective workers={worker_count}, "
+                    f"requested n_cores={requested_workers}, cuda_active={cuda_active})."
+                )
+                out = minimize(
+                    _residual_data_emcee,
+                    params,
+                    args=(data_in,),
+                    method='emcee',
+                    float_behavior='posterior',
+                    nwalkers=nwalkers,
+                    burn=600, #20 - 25 %
+                    steps=4800,
+                    thin=10,
+                    pos=p0,
+                    progress=True,
+                )
+        finally:
+            eval_counter = _MCMC_EVAL_COUNTER
+            _MCMC_RESIDUAL_CONTEXT = None
 
         print("success:", out.success)
         print("message:", getattr(out, "message", "n/a"))
@@ -391,6 +585,14 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
         if hasattr(out, "flatchain"):
             try:
                 posterior_df = out.flatchain.copy()
+                if "log_temp" in posterior_df:
+                    posterior_df["temp"] = np.power(10.0, posterior_df["log_temp"].to_numpy(dtype=float))
+                if "log_radius" in posterior_df:
+                    posterior_df["radius"] = np.power(10.0, posterior_df["log_radius"].to_numpy(dtype=float))
+                if "log_semi_major_axis" in posterior_df:
+                    posterior_df["semi_major_axis"] = np.power(
+                        10.0, posterior_df["log_semi_major_axis"].to_numpy(dtype=float)
+                    )
                 if "raan_raw" in posterior_df:
                     posterior_df["raan"] = np.mod(posterior_df["raan_raw"].to_numpy(), two_pi)
                 if "argument_of_periapsis_raw" in posterior_df:
@@ -459,11 +661,18 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
         fallback_raan = _wrap_angle(out.params["raan_raw"].value) if "raan_raw" in out.params else np.nan
         fallback_argp = _wrap_angle(out.params["argument_of_periapsis_raw"].value) if "argument_of_periapsis_raw" in out.params else np.nan
         fallback_nu = _wrap_angle(out.params["true_anomaly_raw"].value) if "true_anomaly_raw" in out.params else np.nan
+        fallback_temp = _pow10(out.params["log_temp"].value) if "log_temp" in out.params else np.nan
+        fallback_radius = _pow10(out.params["log_radius"].value) if "log_radius" in out.params else np.nan
+        fallback_sma = (
+            _pow10(out.params["log_semi_major_axis"].value)
+            if "log_semi_major_axis" in out.params
+            else np.nan
+        )
 
-        temp, temp_err_low, temp_err_high = _posterior_summary("temp", circular=False, fallback=out.params["temp"].value)
-        radius, radius_err_low, radius_err_high = _posterior_summary("radius", circular=False, fallback=out.params["radius"].value)
+        temp, temp_err_low, temp_err_high = _posterior_summary("temp", circular=False, fallback=fallback_temp)
+        radius, radius_err_low, radius_err_high = _posterior_summary("radius", circular=False, fallback=fallback_radius)
         semi_major_axis, semi_major_axis_err_low, semi_major_axis_err_high = _posterior_summary(
-            "semi_major_axis", circular=False, fallback=out.params["semi_major_axis"].value
+            "semi_major_axis", circular=False, fallback=fallback_sma
         )
         eccentricity, eccentricity_err_low, eccentricity_err_high = _posterior_summary(
             "eccentricity", circular=False, fallback=out.params["eccentricity"].value

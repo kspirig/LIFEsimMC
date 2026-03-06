@@ -203,11 +203,12 @@ class CalibrationStarZCAWhiteningModule(BaseTransformationModule):
         # plt.show()
 
         r_data_out = DataResource(self.n_data_out)
+        data_white = torch.empty_like(data_in)
 
         for i in range(data_in.shape[0]):
-            data_in[i] = i_cov_sqrt[i] @ data_in[i]
+            data_white[i] = i_cov_sqrt[i] @ data_in[i]
 
-        r_data_out.set_data(data_in)
+        r_data_out.set_data(data_white)
 
         if self.n_template_in and self.n_template_out:
             r_template_in = self.get_resource_from_name(self.n_template_in)
@@ -239,11 +240,13 @@ class CalibrationStarZCAWhiteningModule(BaseTransformationModule):
             """Apply the ZCA whitening transformation."""
             if isinstance(data, np.ndarray):
                 i2 = i_cov_sqrt.cpu().numpy()
+                data_white_local = np.array(data, copy=True)
             else:
-                i2 = i_cov_sqrt
-            for l in range(data.shape[0]):
-                data[l] = i2[l] @ data[l]
-            return data
+                i2 = i_cov_sqrt.to(device=data.device, dtype=data.dtype)
+                data_white_local = data.clone()
+            for l in range(data_white_local.shape[0]):
+                data_white_local[l] = i2[l] @ data_white_local[l]
+            return data_white_local
 
         zca = zca_whitening_transformation
 
