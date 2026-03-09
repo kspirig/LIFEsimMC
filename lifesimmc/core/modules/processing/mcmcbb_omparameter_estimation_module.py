@@ -40,8 +40,7 @@ _MCMC_ORBITAL_FAILURE_PRINTED = False
 _MCMC_LOG_EVERY = 200
 
 
-def _identity(x):
-    return x
+
 
 
 def _pow10(x: float) -> float:
@@ -70,8 +69,12 @@ def _snapshot_resource(resource: Any) -> dict:
     snapshot = {}
     if resource is None:
         return snapshot
+    try:
+        resource_items = vars(resource).items()
+    except TypeError:
+        return {"type": str(type(resource)), "repr": str(resource)}
 
-    for key, value in vars(resource).items():
+    for key, value in resource_items:
         if key.startswith("_") or callable(value):
             continue
         if isinstance(value, (str, int, float, bool, type(None))):
@@ -242,7 +245,7 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
         r_config_in = self.get_resource_from_name(self.n_config_in)
         r_transformation_in = self.get_resource_from_name(
             self.n_transformation_in) if self.n_transformation_in else None
-        transf = r_transformation_in.transformation if r_transformation_in else _identity
+        transf = r_transformation_in.transformation if r_transformation_in else None
         planet_params_in = self.get_resource_from_name(self.n_planet_params_in) if self.n_planet_params_in else None
 
 
@@ -392,8 +395,6 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                 lo_safe, hi_safe = lo, hi
             p0[:, j] = rng.uniform(lo_safe, hi_safe, size=nwalkers)
 
-        # Tiny perturbation to avoid accidental duplicate rows.
-        p0 += rng.normal(0.0, 1e-12, size=p0.shape)
         eval_counter = 0
 
         def _wrap_angle(x: float) -> float:
@@ -429,11 +430,9 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                 planet_mass=planet_mass_fixed,
             )
             model = transf(model)
-            if isinstance(model, torch.Tensor):
-                model = model.detach().cpu().numpy()
-            else:
-                model = np.asarray(model)
-            model = np.transpose(model, model_transpose_axes).reshape(data_shape)
+            model = np.transpose(model, (0, 2, 1))
+            model = model.reshape(data_in.shape)
+
             return model, flux
 
         global _MCMC_RESIDUAL_CONTEXT, _MCMC_EVAL_COUNTER, _MCMC_ORBITAL_FAILURE_PRINTED
@@ -450,15 +449,17 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
         )
         _MCMC_EVAL_COUNTER = 0
         _MCMC_ORBITAL_FAILURE_PRINTED = False
+        requested_workers = int(self.n_cores) if self.n_cores is not None else 1
+        if requested_workers < 1:
+            requested_workers = 1
+        max_useful_workers = max(1, nwalkers // 2)
+        worker_count = min(requested_workers, max_useful_workers)
+        mcmc_thin = 10
+        mcmc_burn = 600
+        mcmc_steps = 4800
 
         try:
-            requested_workers = int(self.n_cores) if self.n_cores is not None else 1
-            if requested_workers < 1:
-                requested_workers = 1
-
             # emcee stretch moves update approximately half the walkers at a time.
-            max_useful_workers = max(1, nwalkers // 2)
-            worker_count = min(requested_workers, max_useful_workers)
             if requested_workers > max_useful_workers:
                 print(
                     f"MCMC parallelism: requested n_cores={requested_workers}, "
@@ -473,6 +474,8 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                 worker_count = 1
 
             if worker_count > 1:
+                mcmc_burn = 300
+                mcmc_steps = 2400
                 print(
                     f"CPU MCMC parallelism: running {worker_count} thread workers "
                     f"(requested {requested_workers})."
@@ -485,9 +488,9 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                         method='emcee',
                         float_behavior='posterior',
                         nwalkers=nwalkers,
-                        burn=300,
-                        steps=2400,
-                        thin=10,
+                        burn=mcmc_burn,
+                        steps=mcmc_steps,
+                        thin=mcmc_thin,
                         pos=p0,
                         progress=True,
                         workers=thread_pool,
@@ -504,9 +507,9 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                     method='emcee',
                     float_behavior='posterior',
                     nwalkers=nwalkers,
-                    burn=600, #20 - 25 %
-                    steps=4800,
-                    thin=10,
+                    burn=mcmc_burn,
+                    steps=mcmc_steps,
+                    thin=mcmc_thin,
                     pos=p0,
                     progress=True,
                 )
@@ -514,12 +517,19 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
             eval_counter = _MCMC_EVAL_COUNTER
             _MCMC_RESIDUAL_CONTEXT = None
 
+        acceptance_fraction_mean = np.nan
+        chain_normalized = None
+        split_rhat_by_param = {}
+        autocorr_tau_by_param = {}
+        ess_by_param = {}
+
         print("success:", out.success)
         print("message:", getattr(out, "message", "n/a"))
         print("nfev:", getattr(out, "nfev", "n/a"))
         print("residual evaluations:", eval_counter)
         if hasattr(out, "acceptance_fraction"):
-            print("acceptance fraction:", float(np.mean(out.acceptance_fraction)))
+            acceptance_fraction_mean = float(np.mean(out.acceptance_fraction))
+            print("acceptance fraction:", acceptance_fraction_mean)
         print("chisqr:", getattr(out, "chisqr", "n/a"))
 
         # Basic convergence diagnostics for emcee results.
@@ -539,6 +549,7 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                         chain = np.transpose(chain, (1, 0, 2))
 
                     nwalkers_c, nsteps_c, npar_c = chain.shape
+                    chain_normalized = chain
                     print(f"chain shape: walkers={nwalkers_c}, steps={nsteps_c}, params={npar_c}")
 
                     # Split-Rhat per parameter (split each walker chain in half).
@@ -556,6 +567,7 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                         print("split R_hat by parameter:")
                         for name, val in zip(vary_names, rhat):
                             label = display_name_map.get(name, name)
+                            split_rhat_by_param[label] = float(val)
                             print(f"  {label}: {val:.4f}")
                     else:
                         print("split R_hat skipped: too few steps.")
@@ -570,6 +582,8 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                             tau = float(integrated_time(param_chain, quiet=True))
                             ess = (nwalkers_c * nsteps_c) / max(2.0 * tau, 1e-30)
                             label = display_name_map.get(name, name)
+                            autocorr_tau_by_param[label] = float(tau)
+                            ess_by_param[label] = float(ess)
                             print(f"  {label}: tau={tau:.2f}, ESS~{ess:.1f}, steps/(50*tau)={nsteps_c / max(50.0 * tau, 1e-30):.3f}")
                     except Exception as exc:
                         print(f"autocorr/ESS skipped: {exc}")
@@ -609,6 +623,8 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                 import matplotlib.pyplot as plt
                 from pandas.plotting import scatter_matrix
 
+                posterior_df.to_csv(tables_dir / "posterior_samples.csv", index=False)
+
                 corr_cols = [
                     "temp",
                     "radius",
@@ -630,12 +646,35 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                     fig = fig_axes[0, 0].figure
                     fig.suptitle("MCMC Parameter Correlations", y=1.0)
                     fig.tight_layout()
-                    plot_path = Path.cwd() / f"mcmcbb_om_correlations_{self.n_planet_params_out}_{plot_run_id}.png"
+                    plot_path = plots_dir / "parameter_correlations.png"
                     fig.savefig(plot_path, dpi=180, bbox_inches="tight")
                     plt.close(fig)
                     print(f"Saved MCMC correlation plot to: {plot_path}")
+
+                if chain_normalized is not None and chain_normalized.ndim == 3:
+                    nwalkers_c, nsteps_c, npar_c = chain_normalized.shape
+                    fig, axes = plt.subplots(
+                        npar_c,
+                        1,
+                        figsize=(12, max(2.0 * npar_c, 4.0)),
+                        sharex=True,
+                        squeeze=False,
+                    )
+                    steps_axis = np.arange(nsteps_c)
+                    for j in range(npar_c):
+                        ax = axes[j, 0]
+                        label = display_name_map.get(vary_names[j], vary_names[j]) if j < len(vary_names) else f"param_{j}"
+                        ax.plot(steps_axis, chain_normalized[:, :, j].T, alpha=0.25, lw=0.7, color="tab:blue")
+                        ax.set_ylabel(label)
+                    axes[-1, 0].set_xlabel("MCMC step")
+                    fig.suptitle(f"MCMC Trace Plot ({nwalkers_c} walkers)")
+                    fig.tight_layout()
+                    trace_plot_path = plots_dir / "trace_plot.png"
+                    fig.savefig(trace_plot_path, dpi=180, bbox_inches="tight")
+                    plt.close(fig)
+                    print(f"Saved MCMC trace plot to: {trace_plot_path}")
             except Exception as exc:
-                print(f"Could not generate MCMC correlation plot: {exc}")
+                print(f"Could not generate MCMC posterior plots/tables: {exc}")
 
         def _linear_summary(samples: np.ndarray) -> tuple[float, float, float]:
             q16, q50, q84 = np.percentile(samples, [16, 50, 84])
@@ -693,15 +732,32 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
             wavelengths=wavelengths,
         ) * (radius / distance) ** 2
         fluxes = fluxes.detach().cpu().numpy()
+        best_sample_info = {}
+        best_model_flat = None
+        best_data_flat = None
+        best_residual_flat = None
+        lnprob_flat = None
 
         if posterior_df is not None and hasattr(out, "lnprob"):
             try:
                 import matplotlib.pyplot as plt
 
-                lnprob = np.asarray(out.lnprob).reshape(-1)
-                if len(lnprob) == len(posterior_df):
-                    i_best = int(np.argmax(lnprob))
+                lnprob_flat = np.asarray(out.lnprob).reshape(-1)
+                if len(lnprob_flat) == len(posterior_df):
+                    i_best = int(np.argmax(lnprob_flat))
                     best = posterior_df.iloc[i_best]
+                    best_sample_info = {
+                        "flat_index": int(i_best),
+                        "lnprob": float(lnprob_flat[i_best]),
+                        "temp": float(best["temp"]),
+                        "radius": float(best["radius"]),
+                        "semi_major_axis": float(best["semi_major_axis"]),
+                        "eccentricity": float(best["eccentricity"]),
+                        "inclination": float(best["inclination"]),
+                        "raan": float(best["raan"]),
+                        "argument_of_periapsis": float(best["argument_of_periapsis"]),
+                        "true_anomaly": float(best["true_anomaly"]),
+                    }
                     model_best, _ = _evaluate_model_numpy(
                         temp=float(best["temp"]),
                         radius=float(best["radius"]),
@@ -712,16 +768,19 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                         argument_of_periapsis=float(best["argument_of_periapsis"]),
                         true_anomaly=float(best["true_anomaly"]),
                     )
-                    y_data = data_in.ravel()
-                    y_model = model_best.ravel()
+                    y_data = data_in.ravel().astype(float)
+                    y_model = model_best.ravel().astype(float)
                     y_res = y_data - y_model
+                    best_data_flat = y_data
+                    best_model_flat = y_model
+                    best_residual_flat = y_res
                     x = np.arange(y_data.size)
 
                     fig, axes = plt.subplots(
-                        2,
+                        3,
                         1,
-                        figsize=(12, 6),
-                        gridspec_kw={"height_ratios": [3, 1]},
+                        figsize=(12, 8),
+                        gridspec_kw={"height_ratios": [3, 1.4, 1.2]},
                         sharex=True,
                     )
                     axes[0].plot(x, y_data, lw=1.0, label="data")
@@ -729,15 +788,33 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
                     axes[0].legend(loc="best")
                     axes[0].set_ylabel("counts")
                     axes[0].set_title("Maximum-Likelihood Sample Fit Check")
-                    axes[1].plot(x, y_res, lw=0.8)
+                    axes[1].plot(x, y_res, lw=0.8, color="tab:green")
                     axes[1].axhline(0.0, color="k", lw=0.8, ls="--")
                     axes[1].set_ylabel("residual")
-                    axes[1].set_xlabel("flattened data index")
+                    if np.isfinite(np.nanstd(y_data)) and np.nanstd(y_data) > 0:
+                        normalized_res = y_res / np.nanstd(y_data)
+                    else:
+                        normalized_res = y_res
+                    axes[2].plot(x, normalized_res, lw=0.8, color="tab:red")
+                    axes[2].axhline(0.0, color="k", lw=0.8, ls="--")
+                    axes[2].set_ylabel("res/std(data)")
+                    axes[2].set_xlabel("flattened data index")
                     fig.tight_layout()
-                    sanity_plot_path = Path.cwd() / f"mcmcbb_om_fitcheck_{self.n_planet_params_out}_{plot_run_id}.png"
+                    sanity_plot_path = plots_dir / "fitcheck_best_sample.png"
                     fig.savefig(sanity_plot_path, dpi=180, bbox_inches="tight")
                     plt.close(fig)
                     print(f"Saved MCMC fit sanity plot to: {sanity_plot_path}")
+
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    ax.hist(y_res, bins=80, density=True, alpha=0.8, color="tab:green")
+                    ax.set_title("Residual Distribution (Best Posterior Sample)")
+                    ax.set_xlabel("residual")
+                    ax.set_ylabel("density")
+                    fig.tight_layout()
+                    residual_hist_path = plots_dir / "residual_histogram.png"
+                    fig.savefig(residual_hist_path, dpi=180, bbox_inches="tight")
+                    plt.close(fig)
+                    print(f"Saved residual histogram to: {residual_hist_path}")
             except Exception as exc:
                 print(f"Could not generate MCMC fit sanity plot: {exc}")
 
@@ -792,6 +869,182 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
         else:
             flux_err = np.full_like(fluxes, np.nan, dtype=float)
 
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            ax.plot(wavelengths, fluxes, lw=1.6, color="tab:blue", label="retrieved SED")
+            if np.any(np.isfinite(flux_err)):
+                low = np.asarray(fluxes - flux_err, dtype=float)
+                high = np.asarray(fluxes + flux_err, dtype=float)
+                ax.fill_between(wavelengths, low, high, color="tab:blue", alpha=0.25, label="1-sigma")
+            ax.set_xlabel("wavelength [m]")
+            ax.set_ylabel("photon flux density")
+            ax.set_title("Retrieved Planet SED")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            sed_plot_path = plots_dir / "retrieved_sed.png"
+            fig.savefig(sed_plot_path, dpi=180, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved retrieved SED plot to: {sed_plot_path}")
+        except Exception as exc:
+            print(f"Could not generate retrieved SED plot: {exc}")
+
+        param_setup = {}
+        for name, par in params.items():
+            init_value = par.value
+            if hasattr(par, "init_value") and par.init_value is not None:
+                init_value = par.init_value
+            param_setup[name] = {
+                "initial_value": init_value,
+                "min": par.min,
+                "max": par.max,
+                "vary": bool(par.vary),
+            }
+
+        final_parameter_summary = {
+            "temp": {"value": temp, "err_low": temp_err_low, "err_high": temp_err_high},
+            "radius": {"value": radius, "err_low": radius_err_low, "err_high": radius_err_high},
+            "semi_major_axis": {
+                "value": semi_major_axis,
+                "err_low": semi_major_axis_err_low,
+                "err_high": semi_major_axis_err_high,
+            },
+            "eccentricity": {"value": eccentricity, "err_low": eccentricity_err_low, "err_high": eccentricity_err_high},
+            "inclination": {"value": inclination, "err_low": inclination_err_low, "err_high": inclination_err_high},
+            "raan": {"value": raan, "err_low": raan_err_low, "err_high": raan_err_high},
+            "argument_of_periapsis": {
+                "value": argument_of_periapsis,
+                "err_low": argument_of_periapsis_err_low,
+                "err_high": argument_of_periapsis_err_high,
+            },
+            "true_anomaly": {"value": true_anomaly, "err_low": true_anomaly_err_low, "err_high": true_anomaly_err_high},
+            "mass": {"value": mass, "err_low": mass_err, "err_high": mass_err},
+        }
+
+        np.save(arrays_dir / "times.npy", np.asarray(times))
+        np.save(arrays_dir / "wavelengths.npy", np.asarray(wavelengths))
+        np.save(arrays_dir / "wavelength_bin_widths.npy", np.asarray(wavelength_bin_widths))
+        np.save(arrays_dir / "data_flattened.npy", np.asarray(data_in))
+        np.save(arrays_dir / "initial_walkers_p0.npy", np.asarray(p0))
+        np.save(arrays_dir / "retrieved_flux.npy", np.asarray(fluxes))
+        np.save(arrays_dir / "retrieved_flux_err.npy", np.asarray(flux_err))
+        if sigma_in is not None:
+            np.save(arrays_dir / "sigma_flattened.npy", np.asarray(sigma_in))
+        if cov_out is not None:
+            np.save(arrays_dir / "covariance.npy", np.asarray(cov_out))
+        chain_raw = getattr(out, "chain", None)
+        if chain_raw is not None:
+            np.save(arrays_dir / "chain_raw.npy", np.asarray(chain_raw))
+        if chain_normalized is not None:
+            np.save(arrays_dir / "chain_normalized.npy", np.asarray(chain_normalized))
+        if hasattr(out, "lnprob"):
+            np.save(arrays_dir / "lnprob.npy", np.asarray(out.lnprob))
+        if lnprob_flat is not None:
+            np.save(arrays_dir / "lnprob_flat.npy", np.asarray(lnprob_flat))
+        if best_data_flat is not None:
+            np.save(arrays_dir / "best_data_flat.npy", np.asarray(best_data_flat))
+        if best_model_flat is not None:
+            np.save(arrays_dir / "best_model_flat.npy", np.asarray(best_model_flat))
+        if best_residual_flat is not None:
+            np.save(arrays_dir / "best_residual_flat.npy", np.asarray(best_residual_flat))
+
+        if posterior_df is not None:
+            try:
+                posterior_df.describe(percentiles=[0.16, 0.5, 0.84]).to_csv(tables_dir / "posterior_describe.csv")
+            except Exception as exc:
+                print(f"Could not save posterior summary table: {exc}")
+
+        run_finished_utc = datetime.utcnow()
+        repro_metadata = {
+            "run_id": plot_run_id,
+            "started_utc": run_started_utc.isoformat() + "Z",
+            "finished_utc": run_finished_utc.isoformat() + "Z",
+            "duration_seconds": (run_finished_utc - run_started_utc).total_seconds(),
+            "module": self.__class__.__name__,
+            "module_file": str(Path(__file__).resolve()),
+            "python_version": sys.version,
+            "platform": platform.platform(),
+            "numpy_version": np.__version__,
+            "torch_version": torch.__version__,
+            "resource_names": {
+                "config_in": self.n_config_in,
+                "data_in": self.n_data_in,
+                "transformation_in": self.n_transformation_in,
+                "template_in": self.n_template_in,
+                "planet_params_in": self.n_planet_params_in,
+                "planet_params_out": self.n_planet_params_out,
+            },
+            "resource_snapshots": {
+                "config": _snapshot_resource(r_config_in),
+                "data": _snapshot_resource(data_resource),
+                "transformation": _snapshot_resource(r_transformation_in),
+                "planet_params_in": _snapshot_resource(planet_params_in),
+            },
+            "star_context": {
+                "distance_m": r_config_in.scene.star.distance,
+                "mass_kg": r_config_in.scene.star.mass,
+            },
+            "likelihood": {
+                "mode": "poisson" if use_poisson_likelihood else ("gaussian_with_sigma" if sigma_in is not None else "gaussian_unit_sigma"),
+                "sigma_present": bool(sigma_in is not None),
+            },
+            "sampling_config": {
+                "method": "lmfit.emcee",
+                "seed": mcmc_seed,
+                "nwalkers": nwalkers,
+                "ndim": ndim,
+                "varying_parameters": vary_names,
+                "thin": mcmc_thin,
+                "burn": mcmc_burn,
+                "steps": mcmc_steps,
+                "requested_workers": requested_workers,
+                "effective_workers": worker_count,
+                "cuda_active": bool(cuda_active),
+            },
+            "parameter_setup": param_setup,
+            "diagnostics": {
+                "success": bool(getattr(out, "success", False)),
+                "message": str(getattr(out, "message", "")),
+                "nfev": int(getattr(out, "nfev", -1)) if getattr(out, "nfev", None) is not None else None,
+                "residual_evaluations": int(eval_counter),
+                "chisqr": getattr(out, "chisqr", None),
+                "acceptance_fraction_mean": acceptance_fraction_mean,
+                "split_rhat": split_rhat_by_param,
+                "autocorr_tau": autocorr_tau_by_param,
+                "ess": ess_by_param,
+            },
+            "best_sample": best_sample_info,
+            "final_parameters": final_parameter_summary,
+            "units": {
+                "wavelength": "m",
+                "distance": "m",
+                "mass": "kg",
+                "angles": "rad",
+                "temperature": "K",
+                "radius": "m",
+                "semi_major_axis": "m",
+            },
+        }
+        _write_json(run_dir / "reproducibility_metadata.json", repro_metadata)
+        _write_json(run_dir / "final_parameter_summary.json", final_parameter_summary)
+
+        readme_text = (
+            "MCMCBB OM run artifacts\n"
+            "=======================\n\n"
+            "This folder contains enough saved outputs to inspect posterior distributions,\n"
+            "recreate plots, and analyze the fitted result without rerunning MCMC.\n\n"
+            "Key files:\n"
+            "- reproducibility_metadata.json: full run settings, diagnostics, and input snapshots\n"
+            "- final_parameter_summary.json: fitted parameters with uncertainty bounds\n"
+            "- tables/posterior_samples.csv: flattened posterior samples\n"
+            "- arrays/chain_raw.npy and arrays/lnprob.npy: raw emcee outputs\n"
+            "- arrays/data_flattened.npy and arrays/best_*_flat.npy: fit comparison vectors\n"
+            "- plots/*.png: correlation, trace, fit-check, residual, and SED plots\n"
+        )
+        (run_dir / "README.txt").write_text(readme_text, encoding="utf-8")
+        print(f"Saved reproducibility metadata to: {run_dir / 'reproducibility_metadata.json'}")
+
         # TODO: Implement multi-planet signal extraction
         r_planet_params_out = PlanetParamsResource(
             name=self.n_planet_params_out,
@@ -845,5 +1098,6 @@ class MCMCBBOMParameterEstimationModule(BaseModule):
         print(f"SMA {semi_major_axis:.6g} -{semi_major_axis_err_low:.3g}/+{semi_major_axis_err_high:.3g}")
         print(f"Temperature {temp:.6g} -{temp_err_low:.3g}/+{temp_err_high:.3g}")
         print(f"Radius {radius:.6g} -{radius_err_low:.3g}/+{radius_err_high:.3g}")
+        print(f"Run outputs saved under: {run_dir}")
         print('Done')
         return r_planet_params_out
