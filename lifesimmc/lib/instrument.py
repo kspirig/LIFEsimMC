@@ -44,7 +44,7 @@ class LIFEReferenceDesign(Instrument):
             kernels=DoubleBracewell.kernels,
             aperture_diameter=3.5 * u.m,
             nulling_baseline_min=10 * u.m,
-            nulling_baseline_max=60 * u.m,
+            nulling_baseline_max=100 * u.m,
             spectral_resolving_power=50,
             wavelength_min=4 * u.um,
             wavelength_max=18.5 * u.um,
