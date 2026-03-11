@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from lmfit import minimize, Parameters
+from astropy.table import Table
 
 from lifesimmc.core.modules.base_module import BaseModule
 from lifesimmc.core.resources.base_resource import BaseResource
@@ -242,7 +243,7 @@ class MLParameterEstimationModuleDivided(BaseModule):
             fitted_posx.append(posx)
             fitted_posy.append(posy)
 
-        # Fit geometric Keplerian orbit (no timing) with per-point anomaly nuisance parameters.
+        # Fit orbit with orbitize (OFTI sampler) on the fitted astrometric points.
         orbit_fit_curve_x = None
         orbit_fit_curve_y = None
         orbit_fit_ok = False
@@ -251,138 +252,103 @@ class MLParameterEstimationModuleDivided(BaseModule):
         n_obs = len(posx_obs)
         if n_obs >= 3:
             try:
-                from scipy.optimize import least_squares
+                import orbitize.kepler
+                import orbitize.sampler
+                import orbitize.system
 
-                def _orbit_xy(log_a_val, h_val, k_val, cos_i_val, omega_node_val, nus):
-                    e_val = np.sqrt(h_val ** 2 + k_val ** 2)
-                    if e_val >= 1.0:
-                        raise ValueError("Eccentricity must be < 1")
-                    omega_arg_val = np.arctan2(k_val, h_val)
-                    inc_val = np.arccos(np.clip(cos_i_val, -1.0, 1.0))
-                    a_val = 10.0 ** log_a_val  # angular semi-major axis [rad]
-                    nus = np.asarray(nus, dtype=float)
+                rad_to_mas = (180.0 / np.pi) * 3600.0 * 1000.0
+                mas_to_rad = 1.0 / rad_to_mas
 
-                    # Kepler geometry in orbital plane: r = a(1-e^2)/(1+e cos nu)
-                    r = a_val * (1.0 - e_val ** 2) / (1.0 + e_val * np.cos(nus))
-                    u_arg = omega_arg_val + nus
+                sep_mas = np.sqrt(posx_obs ** 2 + posy_obs ** 2) * rad_to_mas
+                # PA convention for orbitize (East of North): atan2(RA_offset, Dec_offset)
+                pa_deg = np.mod(np.degrees(np.arctan2(posx_obs, posy_obs)), 360.0)
 
-                    cos_O = np.cos(omega_node_val)
-                    sin_O = np.sin(omega_node_val)
-                    cos_u = np.cos(u_arg)
-                    sin_u = np.sin(u_arg)
-                    cos_i = np.cos(inc_val)
+                sep_err_mas = np.maximum(1e-3, 0.05 * np.maximum(sep_mas, 1e-3))
+                pa_err_deg = np.full_like(pa_deg, 1.0)
 
-                    # Projection to sky-plane offsets (x, y), in radians.
-                    x_vals = r * (cos_O * cos_u - sin_O * sin_u * cos_i)
-                    y_vals = r * (sin_O * cos_u + cos_O * sin_u * cos_i)
-                    return x_vals, y_vals
-
-                def _residual_orbit(theta):
-                    log_a_val = theta[0]
-                    h_val = theta[1]
-                    k_val = theta[2]
-                    cos_i_val = theta[3]
-                    omega_node_val = theta[4]
-                    nus = theta[5:]
-                    e_val = np.sqrt(h_val ** 2 + k_val ** 2)
-                    if e_val >= 0.999 or np.abs(cos_i_val) > 1.0:
-                        return np.full(2 * n_obs, 1e6, dtype=float)
-                    try:
-                        x_model, y_model = _orbit_xy(log_a_val, h_val, k_val, cos_i_val, omega_node_val, nus)
-                    except Exception:
-                        return np.full(2 * n_obs, 1e6, dtype=float)
-                    return np.concatenate((posx_obs - x_model, posy_obs - y_model))
-
-                pa_guess = np.mod(np.arctan2(posy_obs, posx_obs), 2.0 * np.pi)
-                a_guess = np.maximum(np.median(np.sqrt(posx_obs ** 2 + posy_obs ** 2)), 1e-12)
-                log_a0 = np.log10(a_guess)
-                log_a_min = np.log10(max(1e-12, a_guess * 0.01))
-                log_a_max = np.log10(max(1e-11, a_guess * 100.0))
-                lower = np.concatenate(([log_a_min, -0.99, -0.99, -1.0, 0.0], np.zeros(n_obs)))
-                upper = np.concatenate(([log_a_max, 0.99, 0.99, 1.0, 2.0 * np.pi], np.full(n_obs, 2.0 * np.pi)))
-
-                best_result = None
-                rng = np.random.default_rng(123)
-                n_restarts = 24
-                initial_x0 = np.concatenate((
-                    [log_a0, 0.1, 0.0, np.cos(np.deg2rad(60.0)), 0.0],
-                    pa_guess
-                ))
-                initial_x0 = np.clip(initial_x0, lower + 1e-12, upper - 1e-12)
-                for r in range(n_restarts):
-                    if r == 0:
-                        x0 = initial_x0.copy()
-                    else:
-                        h0 = rng.uniform(-0.5, 0.5)
-                        k0 = rng.uniform(-0.5, 0.5)
-                        if np.sqrt(h0 ** 2 + k0 ** 2) >= 0.99:
-                            h0, k0 = 0.1, 0.0
-                        x0 = np.concatenate((
-                            [rng.uniform(log_a_min, log_a_max), h0, k0, rng.uniform(-1.0, 1.0), rng.uniform(0.0, 2.0 * np.pi)],
-                            np.mod(pa_guess + rng.normal(0.0, 0.35, size=n_obs), 2.0 * np.pi)
-                        ))
-                        if r % 3 == 0:
-                            # occasional wider restart to escape local minima
-                            x0[5:] = rng.uniform(0.0, 2.0 * np.pi, size=n_obs)
-                    x0 = np.clip(x0, lower + 1e-12, upper - 1e-12)
-
-                    result = least_squares(
-                        _residual_orbit,
-                        x0,
-                        bounds=(lower, upper),
-                        method="trf",
-                        max_nfev=12000,
-                        ftol=1e-10,
-                        xtol=1e-10,
-                        gtol=1e-10,
-                    )
-                    if best_result is None or result.cost < best_result.cost:
-                        best_result = result
-
-                if best_result is not None and best_result.success:
-                    theta_best = best_result.x
-                    log_a_fit = theta_best[0]
-                    h_fit = theta_best[1]
-                    k_fit = theta_best[2]
-                    cos_i_fit = theta_best[3]
-                    omega_node_fit = theta_best[4]
-                    nus_fit = theta_best[5:]
-                    e_fit = np.sqrt(h_fit ** 2 + k_fit ** 2)
-                    omega_arg_fit = np.arctan2(k_fit, h_fit)
-                    inc_fit = np.arccos(np.clip(cos_i_fit, -1.0, 1.0))
-                    a_fit = 10.0 ** log_a_fit
-
-                    print("Geometric orbit fit successful:")
-                    print("initial cost:", 0.5 * np.sum(_residual_orbit(initial_x0) ** 2))
-                    print("final cost:", best_result.cost)
-                    print("cost ratio final/initial:", best_result.cost / (0.5 * np.sum(_residual_orbit(initial_x0) ** 2) + 1e-30))
-                    print("a (angular, rad):", a_fit)
-                    print("log_a:", log_a_fit)
-                    print("e:", e_fit)
-                    print("h = e cos(omega):", h_fit)
-                    print("k = e sin(omega):", k_fit)
-                    print("i (rad):", inc_fit)
-                    print("i (deg):", np.rad2deg(inc_fit))
-                    print("Omega (rad):", omega_node_fit)
-                    print("Omega (deg):", np.rad2deg(omega_node_fit))
-                    print("omega (rad):", omega_arg_fit)
-                    print("omega (deg):", np.rad2deg(omega_arg_fit))
-                    print("nu_i (rad):", nus_fit)
-                    print("nu_i (deg):", np.rad2deg(nus_fit))
-                    nu_grid = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
-                    orbit_fit_curve_x, orbit_fit_curve_y = _orbit_xy(
-                        log_a_fit,
-                        h_fit,
-                        k_fit,
-                        cos_i_fit,
-                        omega_node_fit,
-                        nu_grid
-                    )
-                    orbit_fit_ok = True
+                if len(times) >= n_obs:
+                    epoch_mjd = 59000.0 + times[:n_obs] / 86400.0
                 else:
-                    print("Geometric orbit fit failed to converge.")
+                    epoch_mjd = 59000.0 + np.arange(n_obs, dtype=float)
+
+                table_rows = []
+                for i_obs in range(n_obs):
+                    table_rows.append(
+                        (
+                            float(epoch_mjd[i_obs]),
+                            1,
+                            "seppa",
+                            float(sep_mas[i_obs]),
+                            float(sep_err_mas[i_obs]),
+                            float(pa_deg[i_obs]),
+                            float(pa_err_deg[i_obs]),
+                            np.nan,
+                            "LIFEsim",
+                        )
+                    )
+                data_table = Table(
+                    rows=table_rows,
+                    names=[
+                        "epoch",
+                        "object",
+                        "quant_type",
+                        "quant1",
+                        "quant1_err",
+                        "quant2",
+                        "quant2_err",
+                        "quant12_corr",
+                        "instrument",
+                    ],
+                )
+
+                stellar_mass_msun = float(r_config_in.scene.star.mass / const.M_sun.value)
+                distance_pc = float(r_config_in.scene.star.distance / const.pc.value)
+                plx_mas = 1000.0 / max(distance_pc, 1e-6)
+
+                orb_system = orbitize.system.System(
+                    1,
+                    data_table,
+                    stellar_mass_msun,
+                    plx_mas,
+                )
+                ofti_sampler = orbitize.sampler.OFTI(orb_system)
+                # Small default for runtime; increase for smoother posterior.
+                ofti_samples = ofti_sampler.run_sampler(total_orbits=2000)
+
+                median_sample = np.median(ofti_samples, axis=0)
+                sma_au = float(median_sample[0])
+                ecc = float(median_sample[1])
+                inc = float(median_sample[2])
+                aop = float(median_sample[3])
+                pan = float(median_sample[4])
+                tau = float(median_sample[5])
+                plx_fit = float(median_sample[6])
+                mtot_fit = float(median_sample[7])
+
+                epoch_grid = np.linspace(np.min(epoch_mjd), np.max(epoch_mjd), 720)
+                raoff_mas, deoff_mas, _ = orbitize.kepler.calc_orbit(
+                    epoch_grid,
+                    sma_au,
+                    ecc,
+                    inc,
+                    aop,
+                    pan,
+                    tau,
+                    plx_fit,
+                    mtot_fit,
+                )
+                orbit_fit_curve_x = raoff_mas * mas_to_rad
+                orbit_fit_curve_y = deoff_mas * mas_to_rad
+                orbit_fit_ok = True
+
+                print("orbitize OFTI fit successful:")
+                print("sma [au]:", sma_au)
+                print("ecc:", ecc)
+                print("inc [deg]:", np.degrees(inc))
+                print("aop [deg]:", np.degrees(aop))
+                print("pan [deg]:", np.degrees(pan))
             except Exception as exc:
-                print(f"Geometric orbit fit skipped: {exc}")
+                print(f"orbitize OFTI fit skipped: {exc}")
 
         plt.figure(figsize=(6, 6))
         for i, gt_track in enumerate(gt_tracks):

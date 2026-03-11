@@ -15,46 +15,6 @@ from lifesimmc.core.resources.planet_params_resource import PlanetParamsResource
 from astropy import constants as const
 from phringe.util.spectrum import get_blackbody_spectrum_standard_units
 import astropy.units as u
-from astropy.constants import R_earth
-
-
-_TWO_PI = 2.0 * np.pi
-
-
-def wrap_to_2pi(x):
-    return np.mod(x, _TWO_PI)
-
-
-def wrap_to_pi(x):
-    return (np.asarray(x) + np.pi) % _TWO_PI - np.pi
-
-
-def _circular_mean(samples: np.ndarray) -> float:
-    wrapped = wrap_to_2pi(np.asarray(samples, dtype=float))
-    return float(wrap_to_2pi(np.arctan2(np.mean(np.sin(wrapped)), np.mean(np.cos(wrapped)))))
-
-
-def _circular_summary(samples: np.ndarray) -> tuple[float, float]:
-    wrapped = wrap_to_2pi(np.asarray(samples, dtype=float))
-    center = _circular_mean(wrapped)
-    shifted = wrap_to_pi(wrapped - center)
-    q16, q50, q84 = np.percentile(shifted, [16, 50, 84])
-    value = float(wrap_to_2pi(center + q50))
-    err = float(0.5 * ((q84 - q50) + (q50 - q16)))
-    return value, err
-
-
-def _linear_summary(samples: np.ndarray) -> tuple[float, float]:
-    arr = np.asarray(samples, dtype=float)
-    q16, q50, q84 = np.percentile(arr, [16, 50, 84])
-    return float(q50), float(0.5 * ((q84 - q50) + (q50 - q16)))
-
-
-def _hk_to_orbital_elements(h: float, k: float) -> tuple[float, float]:
-    eccentricity = float(h ** 2 + k ** 2)
-    argument_of_periapsis = float(wrap_to_2pi(np.arctan2(k, h)))
-    return eccentricity, argument_of_periapsis
-
 
 class MCMCOMParameterEstimationModule(BaseModule):
     """Class representation of a module that performs maximum likelihood estimation (MLE) of planet parameters.
@@ -142,18 +102,15 @@ class MCMCOMParameterEstimationModule(BaseModule):
 
         a_max = distance * np.tan(hfov_max)
 
-        radius_init = 1 * 1e6  # 1 Earth radius in meters
-        temp_init = 250    # Kelvin
-        semi_major_axis_init = (1* const.au.value) # Can we evaluate quite good?
+        radius_init = 10 * 1e6  # 1 Earth radius in meters
+        temp_init = 2000.0      # Kelvin
+        semi_major_axis_init = 2 * const.au.value # Can we evaluate quite good?
         eccentricity_init  = 0.0
         inclination_init = np.pi / 2
         cos_inclination_init = np.cos(inclination_init)
         raan_init = np.pi
         argument_of_periapsis_init = np.pi
         true_anomaly_init = np.pi
-        hk_radius_init = np.sqrt(max(eccentricity_init, 0.0))
-        h_init = hk_radius_init * np.cos(argument_of_periapsis_init)
-        k_init = hk_radius_init * np.sin(argument_of_periapsis_init)
 
 
 
@@ -163,8 +120,8 @@ class MCMCOMParameterEstimationModule(BaseModule):
 
         params = Parameters()
 
-        params.add("log_temp", value=np.log10(temp_init), min=np.log10(150), max=np.log10(350)) ## kleiner high temperature
-        params.add("log_radius", value=np.log10(radius_init), min=np.log10(0.5 * R_earth.value), max=np.log10(1.5 * R_earth.value))
+        params.add("log_temp", value=np.log10(temp_init), min=np.log10(50), max=np.log10(4000)) ## kleiner high temperature
+        params.add("log_radius", value=np.log10(radius_init), min=np.log10(1e5), max=np.log10(2 * 1e8))
         params.add(
             "log_semi_major_axis",
             value=np.log10(semi_major_axis_init),
@@ -172,16 +129,15 @@ class MCMCOMParameterEstimationModule(BaseModule):
             max=np.log10(a_max),
         )
 
-        params.add("h", value=h_init, min=-0.999999, max=0.999999)
-        params.add("k", value=k_init, min=-0.999999, max=0.999999)
+        params.add('eccentricity',value = eccentricity_init,min = 0,max = 1.0)
 
         params.add('cos_inclination', value=cos_inclination_init, min=-1.0, max=1.0)
-        params.add('raan',value = raan_init,min = 0,max = _TWO_PI)
+        params.add('raan',value = raan_init,min = 0,max = 2.0 * np.pi)
+        params.add('argument_of_periapsis',value = argument_of_periapsis_init,min = 0,max = 2.0 * np.pi)
 
-        params.add('true_anomaly',value = true_anomaly_init,min = 0,max = _TWO_PI)
+        params.add('true_anomaly',value = true_anomaly_init,min = 0,max = 2.0 * np.pi)
 
-        params_names = np.array(["log_temp","log_radius","log_semi_major_axis","h","k","cos_inclination","raan","true_anomaly"])
-        circular_param_names = {"raan", "argument_of_periapsis", "true_anomaly"}
+        params_names = np.array(["log_temp","log_radius","log_semi_major_axis","eccentricity","cos_inclination","raan","argument_of_periapsis","true_anomaly"])
 
         mcmc_seed = 12345
         ndim = len(params_names)
@@ -195,21 +151,14 @@ class MCMCOMParameterEstimationModule(BaseModule):
             flux = flux.detach().cpu().numpy()
             cos_inclination = float(np.clip(params['cos_inclination'].value, -1.0, 1.0))
             inclination = float(np.arccos(cos_inclination))
-            h = float(params["h"].value)
-            k = float(params["k"].value)
-            eccentricity, argument_of_periapsis = _hk_to_orbital_elements(h, k)
-            raan = float(wrap_to_2pi(params["raan"].value))
-            true_anomaly = float(wrap_to_2pi(params["true_anomaly"].value))
-            if (not np.isfinite(eccentricity)) or eccentricity >= 1.0:
-                return np.full_like(target, 1e30, dtype=float)
             eval_counter += 1
             if eval_counter % 20 == 0:
                 print(
                     f"[Eval {eval_counter}] "
                     f"T={10**params['log_temp'].value:.6g}, R={10**params['log_radius'].value:.6g}, "
-                    f"a={10**params['log_semi_major_axis'].value:.6g}, h={h:.6g}, k={k:.6g}, e={eccentricity:.6g}, "
-                    f"inc={inclination:.6g}, raan={raan:.6g}, "
-                    f"argp={argument_of_periapsis:.6g}, nu={true_anomaly:.6g}"
+                    f"a={10**params['log_semi_major_axis'].value:.6g}, e={params['eccentricity'].value:.6g}, "
+                    f"inc={inclination:.6g}, raan={params['raan'].value:.6g}, "
+                    f"argp={params['argument_of_periapsis'].value:.6g}, nu={params['true_anomaly'].value:.6g}"
                 )
 
             try:
@@ -217,11 +166,11 @@ class MCMCOMParameterEstimationModule(BaseModule):
                     kernels=True,
                     spectral_energy_distribution=flux,
                     semi_major_axis = 10**params['log_semi_major_axis'].value,
-                    eccentricity = eccentricity,
+                    eccentricity = params['eccentricity'].value,
                     inclination = inclination ,
-                    raan = raan,
-                    argument_of_periapsis = argument_of_periapsis,
-                    true_anomaly = true_anomaly,
+                    raan = params['raan'].value,
+                    argument_of_periapsis = params['argument_of_periapsis'].value,
+                    true_anomaly = params['true_anomaly'].value,
                     host_star_distance=r_config_in.scene.star.distance,
                     host_star_mass=r_config_in.scene.star.mass,
                     planet_mass=planet_mass_fixed
@@ -319,22 +268,6 @@ class MCMCOMParameterEstimationModule(BaseModule):
                         params[params_names[j]].min,
                         params[params_names[j]].max
                     )
-            if "h" in params_names and "k" in params_names:
-                h_idx = int(np.where(params_names == "h")[0][0])
-                k_idx = int(np.where(params_names == "k")[0][0])
-                hk_radius_cap = 1.0 - 1e-12
-                invalid_orbits = (run_p0[:, h_idx] ** 2 + run_p0[:, k_idx] ** 2) >= 1.0
-                while np.any(invalid_orbits):
-                    n_invalid = int(np.sum(invalid_orbits))
-                    radii = np.sqrt(run_rng.uniform(0.0, hk_radius_cap ** 2, size=n_invalid))
-                    phases = run_rng.uniform(0.0, _TWO_PI, size=n_invalid)
-                    run_p0[invalid_orbits, h_idx] = radii * np.cos(phases)
-                    run_p0[invalid_orbits, k_idx] = radii * np.sin(phases)
-                    invalid_orbits = (run_p0[:, h_idx] ** 2 + run_p0[:, k_idx] ** 2) >= 1.0
-            for angle_name in ("raan", "true_anomaly", "argument_of_periapsis"):
-                if angle_name in params_names:
-                    angle_idx = int(np.where(params_names == angle_name)[0][0])
-                    run_p0[:, angle_idx] = wrap_to_2pi(run_p0[:, angle_idx])
             run_initial_positions[run_idx] = run_p0.copy()
 
             print(f"MCMC run {run_idx + 1}/{run_count}: nwalkers={walkers_per_run}")
@@ -364,42 +297,14 @@ class MCMCOMParameterEstimationModule(BaseModule):
 
         var_names = list(out.var_names) if out.var_names is not None else list(params_names)
         merged_chain = np.vstack([res.flatchain[var_names].to_numpy() for res in run_results])
-        var_name_to_idx = {name: i for i, name in enumerate(var_names)}
-        if "h" in var_name_to_idx and "k" in var_name_to_idx:
-            h_samples = merged_chain[:, var_name_to_idx["h"]]
-            k_samples = merged_chain[:, var_name_to_idx["k"]]
-            posterior_eccentricity_samples = h_samples ** 2 + k_samples ** 2
-            valid_orbits = posterior_eccentricity_samples < 1.0
-            if not np.all(valid_orbits):
-                merged_chain = merged_chain[valid_orbits]
-                h_samples = merged_chain[:, var_name_to_idx["h"]]
-                k_samples = merged_chain[:, var_name_to_idx["k"]]
-                posterior_eccentricity_samples = h_samples ** 2 + k_samples ** 2
-            posterior_argument_of_periapsis_samples = wrap_to_2pi(np.arctan2(k_samples, h_samples))
-        else:
-            posterior_eccentricity_samples = None
-            posterior_argument_of_periapsis_samples = None
-
-        if merged_chain.shape[0] == 0:
-            raise RuntimeError("No valid posterior samples after enforcing e = h^2 + k^2 < 1.")
-
-        chain_for_cov = np.array(merged_chain, copy=True)
-        for i, name in enumerate(var_names):
-            if name in circular_param_names:
-                center = _circular_mean(chain_for_cov[:, i])
-                chain_for_cov[:, i] = wrap_to_pi(chain_for_cov[:, i] - center)
-        combined_cov = np.cov(chain_for_cov, rowvar=False) if chain_for_cov.shape[0] > 1 else None
+        merged_medians = np.median(merged_chain, axis=0)
+        combined_cov = np.cov(merged_chain, rowvar=False) if merged_chain.shape[0] > 1 else None
 
         for i, name in enumerate(var_names):
-            if name not in out.params:
-                continue
-            samples = merged_chain[:, i]
-            if name in circular_param_names:
-                value_i, err_i = _circular_summary(samples)
-            else:
-                value_i, err_i = _linear_summary(samples)
-            out.params[name].value = float(value_i)
-            out.params[name].stderr = float(err_i) if np.isfinite(err_i) else None
+            if name in out.params:
+                out.params[name].value = float(merged_medians[i])
+                if combined_cov is not None:
+                    out.params[name].stderr = float(np.sqrt(combined_cov[i, i]))
 
         print(f"Combined posterior samples: {merged_chain.shape[0]}")
 
@@ -429,26 +334,12 @@ class MCMCOMParameterEstimationModule(BaseModule):
                 plot_samples[:, i] = np.power(10.0, plot_samples[:, i])
                 display_names.append(name.replace("log_", "", 1))
                 is_log_axis.append(True)
-            elif name in circular_param_names:
-                center = _circular_mean(plot_samples[:, i])
-                plot_samples[:, i] = wrap_to_pi(plot_samples[:, i] - center)
-                display_names.append(f"{name}_wrapped")
-                is_log_axis.append(False)
             else:
                 display_names.append(name)
                 is_log_axis.append(False)
-        if posterior_eccentricity_samples is not None and posterior_argument_of_periapsis_samples is not None:
-            plot_samples = np.column_stack([plot_samples, posterior_eccentricity_samples])
-            display_names.append("eccentricity")
-            is_log_axis.append(False)
-            argp_center = _circular_mean(posterior_argument_of_periapsis_samples)
-            argp_wrapped = wrap_to_pi(posterior_argument_of_periapsis_samples - argp_center)
-            plot_samples = np.column_stack([plot_samples, argp_wrapped])
-            display_names.append("argument_of_periapsis_wrapped")
-            is_log_axis.append(False)
 
         try:
-            n_params = len(display_names)
+            n_params = len(var_names)
             fig, axes = plt.subplots(n_params, n_params, figsize=(2.6 * n_params, 2.6 * n_params), squeeze=False)
             for row in range(n_params):
                 for col in range(n_params):
@@ -488,69 +379,6 @@ class MCMCOMParameterEstimationModule(BaseModule):
             print(f"Saved correlation plot to: {corr_plot_path}")
         except Exception as exc:
             print(f"Could not generate correlation plot: {exc}")
-
-        try:
-            chain_raw = getattr(out, "chain", None)
-            if chain_raw is not None:
-                chain = np.asarray(chain_raw, dtype=float)
-                if chain.ndim == 3:
-                    if chain.shape[0] == len(var_names):
-                        chain = np.transpose(chain, (1, 2, 0))
-                    elif chain.shape[2] == len(var_names):
-                        pass
-                    else:
-                        chain = np.transpose(chain, (1, 0, 2))
-                    nwalkers_chain, nsteps_chain, npar_chain = chain.shape
-                    trace_series = []
-                    for j in range(npar_chain):
-                        name = var_names[j] if j < len(var_names) else f"param_{j}"
-                        values = chain[:, :, j]
-                        if name.startswith("log_"):
-                            values = np.power(10.0, values)
-                            label = name.replace("log_", "", 1)
-                            is_circular = False
-                        elif name in circular_param_names:
-                            label = f"{name}_wrapped"
-                            is_circular = True
-                        else:
-                            label = name
-                            is_circular = False
-                        trace_series.append((label, values, is_circular))
-
-                    if "h" in var_names and "k" in var_names:
-                        h_idx = var_names.index("h")
-                        k_idx = var_names.index("k")
-                        ecc_trace = chain[:, :, h_idx] ** 2 + chain[:, :, k_idx] ** 2
-                        argp_trace = wrap_to_2pi(np.arctan2(chain[:, :, k_idx], chain[:, :, h_idx]))
-                        trace_series.append(("eccentricity", ecc_trace, False))
-                        trace_series.append(("argument_of_periapsis_wrapped", argp_trace, True))
-
-                    fig, axes = plt.subplots(
-                        len(trace_series),
-                        1,
-                        figsize=(12, max(2.0 * len(trace_series), 4.0)),
-                        sharex=True,
-                        squeeze=False,
-                    )
-                    steps_axis = np.arange(nsteps_chain)
-                    for j, (label, values, is_circular) in enumerate(trace_series):
-                        ax = axes[j, 0]
-                        if is_circular:
-                            center = _circular_mean(values.reshape(-1))
-                            y_values = wrap_to_pi(values - center)
-                        else:
-                            y_values = values
-                        ax.plot(steps_axis, y_values.T, alpha=0.25, lw=0.7, color="tab:blue")
-                        ax.set_ylabel(label)
-                    axes[-1, 0].set_xlabel("MCMC step")
-                    fig.suptitle(f"MCMC Trace Plot ({nwalkers_chain} walkers)")
-                    fig.tight_layout()
-                    trace_plot_path = run_dir / "trace_plot.png"
-                    fig.savefig(trace_plot_path, dpi=180, bbox_inches="tight")
-                    plt.close(fig)
-                    print(f"Saved trace plot to: {trace_plot_path}")
-        except Exception as exc:
-            print(f"Could not generate trace plot: {exc}")
 
         print("success:", out.success)
         print("nfev:", out.nfev)
@@ -603,98 +431,35 @@ class MCMCOMParameterEstimationModule(BaseModule):
                 linear_err = np.nan
             return linear, linear_err
 
-        def _posterior_samples(name: str):
-            idx = var_name_to_idx.get(name)
-            if idx is None:
-                return None
-            return np.asarray(merged_chain[:, idx], dtype=float)
+        log_temp = _get_param_value('log_temp')
+        log_radius = _get_param_value('log_radius')
+        log_semi_major_axis = _get_param_value('log_semi_major_axis')
 
-        log_temp_samples = _posterior_samples("log_temp")
-        if log_temp_samples is not None and log_temp_samples.size > 1:
-            temp, temp_err = _linear_summary(np.power(10.0, log_temp_samples))
-        else:
-            log_temp = _get_param_value('log_temp')
-            log_temp_err = _get_param_err('log_temp')
-            temp, temp_err = _log10_to_linear_and_err(log_temp, log_temp_err)
+        log_temp_err = _get_param_err('log_temp')
+        log_radius_err = _get_param_err('log_radius')
+        log_semi_major_axis_err = _get_param_err('log_semi_major_axis')
 
-        log_radius_samples = _posterior_samples("log_radius")
-        if log_radius_samples is not None and log_radius_samples.size > 1:
-            radius, radius_err = _linear_summary(np.power(10.0, log_radius_samples))
-        else:
-            log_radius = _get_param_value('log_radius')
-            log_radius_err = _get_param_err('log_radius')
-            radius, radius_err = _log10_to_linear_and_err(log_radius, log_radius_err)
+        temp, temp_err = _log10_to_linear_and_err(log_temp, log_temp_err)
+        radius, radius_err = _log10_to_linear_and_err(log_radius, log_radius_err)
+        semi_major_axis, semi_major_axis_err = _log10_to_linear_and_err(log_semi_major_axis, log_semi_major_axis_err)
 
-        log_sma_samples = _posterior_samples("log_semi_major_axis")
-        if log_sma_samples is not None and log_sma_samples.size > 1:
-            semi_major_axis, semi_major_axis_err = _linear_summary(np.power(10.0, log_sma_samples))
+        eccentricity = _get_param_value('eccentricity')
+        cos_inclination = _get_param_value('cos_inclination')
+        cos_inclination_clipped = np.clip(cos_inclination, -1.0, 1.0) if np.isfinite(cos_inclination) else np.nan
+        inclination = float(np.arccos(cos_inclination_clipped)) if np.isfinite(cos_inclination_clipped) else np.nan
+        raan = _get_param_value('raan')
+        argument_of_periapsis = _get_param_value('argument_of_periapsis')
+        true_anomaly = _get_param_value('true_anomaly')
+        eccentricity_err = _get_param_err('eccentricity')
+        cos_inclination_err = _get_param_err('cos_inclination')
+        if np.isfinite(cos_inclination_err) and np.isfinite(cos_inclination_clipped):
+            denom = np.sqrt(max(1e-16, 1.0 - cos_inclination_clipped ** 2))
+            inclination_err = float(cos_inclination_err / denom)
         else:
-            log_semi_major_axis = _get_param_value('log_semi_major_axis')
-            log_semi_major_axis_err = _get_param_err('log_semi_major_axis')
-            semi_major_axis, semi_major_axis_err = _log10_to_linear_and_err(log_semi_major_axis, log_semi_major_axis_err)
-
-        if posterior_eccentricity_samples is not None and posterior_eccentricity_samples.size > 1:
-            eccentricity, eccentricity_err = _linear_summary(posterior_eccentricity_samples)
-        else:
-            if "h" in out.params and "k" in out.params:
-                eccentricity, _ = _hk_to_orbital_elements(float(out.params["h"].value), float(out.params["k"].value))
-                h_err = _get_param_err("h")
-                k_err = _get_param_err("k")
-                if np.isfinite(h_err) and np.isfinite(k_err):
-                    eccentricity_err = float(np.sqrt((2.0 * out.params["h"].value * h_err) ** 2 + (2.0 * out.params["k"].value * k_err) ** 2))
-                else:
-                    eccentricity_err = np.nan
-            else:
-                eccentricity = _get_param_value('eccentricity')
-                eccentricity_err = _get_param_err('eccentricity')
-
-        cos_inclination_samples = _posterior_samples("cos_inclination")
-        if cos_inclination_samples is not None and cos_inclination_samples.size > 1:
-            cos_inclination_samples = np.clip(cos_inclination_samples, -1.0, 1.0)
-            inclination_samples = np.arccos(cos_inclination_samples)
-            inclination, inclination_err = _linear_summary(inclination_samples)
-        else:
-            cos_inclination = _get_param_value('cos_inclination')
-            cos_inclination_clipped = np.clip(cos_inclination, -1.0, 1.0) if np.isfinite(cos_inclination) else np.nan
-            inclination = float(np.arccos(cos_inclination_clipped)) if np.isfinite(cos_inclination_clipped) else np.nan
-            cos_inclination_err = _get_param_err('cos_inclination')
-            if np.isfinite(cos_inclination_err) and np.isfinite(cos_inclination_clipped):
-                denom = np.sqrt(max(1e-16, 1.0 - cos_inclination_clipped ** 2))
-                inclination_err = float(cos_inclination_err / denom)
-            else:
-                inclination_err = np.nan
-
-        raan_samples = _posterior_samples("raan")
-        if raan_samples is not None and raan_samples.size > 1:
-            raan, raan_err = _circular_summary(raan_samples)
-        else:
-            raan = float(wrap_to_2pi(_get_param_value("raan")))
-            raan_err = _get_param_err("raan")
-
-        if posterior_argument_of_periapsis_samples is not None and posterior_argument_of_periapsis_samples.size > 1:
-            argument_of_periapsis, argument_of_periapsis_err = _circular_summary(posterior_argument_of_periapsis_samples)
-        else:
-            if "h" in out.params and "k" in out.params:
-                _, argument_of_periapsis = _hk_to_orbital_elements(float(out.params["h"].value), float(out.params["k"].value))
-                h_val = float(out.params["h"].value)
-                k_val = float(out.params["k"].value)
-                h_err = _get_param_err("h")
-                k_err = _get_param_err("k")
-                denom = max(h_val ** 2 + k_val ** 2, 1e-16)
-                if np.isfinite(h_err) and np.isfinite(k_err):
-                    argument_of_periapsis_err = float(np.sqrt(((-k_val / denom) * h_err) ** 2 + ((h_val / denom) * k_err) ** 2))
-                else:
-                    argument_of_periapsis_err = np.nan
-            else:
-                argument_of_periapsis = float(wrap_to_2pi(_get_param_value("argument_of_periapsis")))
-                argument_of_periapsis_err = _get_param_err("argument_of_periapsis")
-
-        true_anomaly_samples = _posterior_samples("true_anomaly")
-        if true_anomaly_samples is not None and true_anomaly_samples.size > 1:
-            true_anomaly, true_anomaly_err = _circular_summary(true_anomaly_samples)
-        else:
-            true_anomaly = float(wrap_to_2pi(_get_param_value("true_anomaly")))
-            true_anomaly_err = _get_param_err("true_anomaly")
+            inclination_err = np.nan
+        raan_err = _get_param_err('raan')
+        argument_of_periapsis_err = _get_param_err('argument_of_periapsis')
+        true_anomaly_err = _get_param_err('true_anomaly')
 
         if np.isfinite(temp_err) and np.isfinite(radius_err):
             flux_err = np.sqrt(
@@ -735,7 +500,7 @@ class MCMCOMParameterEstimationModule(BaseModule):
             val = _as_float(value)
             return float(val) if np.isfinite(val) else None
 
-        def _compare_true_fitted(true_value, fitted_value, circular: bool = False):
+        def _compare_true_fitted(true_value, fitted_value):
             if true_value is None:
                 return {
                     "true": None,
@@ -743,14 +508,10 @@ class MCMCOMParameterEstimationModule(BaseModule):
                     "abs_error": None,
                 }
             if np.isfinite(fitted_value):
-                if circular:
-                    abs_error = float(wrap_to_pi(float(fitted_value) - float(true_value)))
-                else:
-                    abs_error = float(fitted_value - true_value)
                 return {
                     "true": float(true_value),
                     "fitted": float(fitted_value),
-                    "abs_error": abs_error,
+                    "abs_error": float(fitted_value - true_value),
                 }
             return {"true": float(true_value), "fitted": None, "abs_error": None}
 
@@ -796,13 +557,9 @@ class MCMCOMParameterEstimationModule(BaseModule):
             "semi_major_axis_m": _compare_true_fitted(true_semi_major_axis, semi_major_axis),
             "eccentricity": _compare_true_fitted(true_eccentricity, eccentricity),
             "inclination_rad": _compare_true_fitted(true_inclination, inclination),
-            "raan_rad": _compare_true_fitted(true_raan, raan, circular=True),
-            "argument_of_periapsis_rad": _compare_true_fitted(
-                true_argument_of_periapsis,
-                argument_of_periapsis,
-                circular=True,
-            ),
-            "true_anomaly_rad": _compare_true_fitted(true_true_anomaly, true_anomaly, circular=True),
+            "raan_rad": _compare_true_fitted(true_raan, raan),
+            "argument_of_periapsis_rad": _compare_true_fitted(true_argument_of_periapsis, argument_of_periapsis),
+            "true_anomaly_rad": _compare_true_fitted(true_true_anomaly, true_anomaly),
         }
 
         reproducibility_metadata = {
@@ -905,13 +662,13 @@ class MCMCOMParameterEstimationModule(BaseModule):
         r_planet_params_out.params.append(planet_params)
         print("Fitted Planet Params:")
         print("Inclination ", inclination)
-        print("Argument of Periapsis ", argument_of_periapsis)
-        print("Eccentricity ", eccentricity)
-        print("RAAN ", raan)
-        print("SMA ", semi_major_axis)
+        print("Argument of Periapsis ", out.params["argument_of_periapsis"].value)
+        print("Eccentricity ",out.params["eccentricity"].value)
+        print("RAAN ",out.params["raan"].value)
+        print("SMA ",10**out.params["log_semi_major_axis"].value)
 
-        print("Temperature ", temp)
-        print("Radius ", radius)
-        print("True Anomaly", true_anomaly)
+        print("Temperature ", 10**out.params['log_temp'].value)
+        print("Radius ", 10**out.params['log_radius'].value)
+        print("True Anomaly",out.params['true_anomaly'].value)
         print('Done')
         return r_planet_params_out
