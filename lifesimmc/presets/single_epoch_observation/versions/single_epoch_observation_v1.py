@@ -139,7 +139,7 @@ class SingleEpochObservationV1(SingleEpochObservation):
             throughput: float = 0.15,
             quantum_efficiency: float = 0.6,
             instrumental_noise: InstrumentalNoise = InstrumentalNoise.NONE,
-            template_fov_rad: float = 1e-6,
+            template_fov_rad: float = None,
             seed: int = None,
             grid_size: int = 40,
             device: torch.device = torch.device('cpu'),
@@ -392,9 +392,15 @@ class SingleEpochObservationV1(SingleEpochObservation):
                 observation=self._observation
             )
             pipeline.add_module(module)
+            pipeline.run()
 
             module = DataGenerationModule(n_setup_in='setup', n_data_out='data')
             pipeline.add_module(module)
+
+            # Set FOV such that planet is within the image, if not specified by the user manually
+            if self.template_fov_rad is None:
+                self.template_fov_rad = pipeline.get_resource('setup').phringe._scene.planets[
+                                            0].sky_coordinates.max().item() * 3
 
             module = TemplateGenerationModule(n_setup_in='setup', n_template_out='temp', fov=self.template_fov_rad)
             pipeline.add_module(module)
