@@ -126,20 +126,26 @@ class ZCAWhiteningModule(BaseTransformationModule):
         nt = noise_ref.shape[2]
 
         noise_ref = noise_ref.reshape(nk * nl, nt)
+        noise_mean = noise_ref.mean(dim=1, keepdim=True)
         cov = torch.cov(noise_ref)
-
-        U, Svals, _ = torch.linalg.svd(cov)
-        w = U @ torch.diag(1 / torch.sqrt(Svals)) @ U.T
+        cov = 0.5 * (cov + cov.T)
+        eps = torch.finfo(cov.dtype).eps * torch.clamp(
+            torch.abs(torch.trace(cov)) / max(cov.shape[0], 1),
+            min=cov.new_tensor(1.0),
+        )
 
         if self.diagonal_only:
-            w = torch.diag(torch.diag(w))
+            w = torch.diag(torch.rsqrt(torch.clamp(torch.diag(cov), min=eps)))
+        else:
+            Svals, U = torch.linalg.eigh(cov)
+            w = U @ torch.diag(torch.rsqrt(torch.clamp(Svals, min=eps))) @ U.T
 
         # Apply the whitening matrix to the data
         data_in = self.get_resource_from_name(self.n_data_in).get_data()
         r_data_out = DataResource(self.n_data_out)
 
         data_in = data_in.reshape(nk * nl, nt)
-        data_in_white = w @ data_in
+        data_in_white = w @ (data_in - noise_mean)
         data_in_white = data_in_white.reshape(nk, nl, nt)
 
         r_data_out.set_data(data_in_white)
@@ -172,14 +178,40 @@ class ZCAWhiteningModule(BaseTransformationModule):
 
         # Save the whitening transformation
         def zca_whitening_transformation(data):
-            """Apply the ZCA whitening transformation."""
+            """Apply the linear ZCA whitening transformation to model counts."""
             if isinstance(data, np.ndarray):
                 w1 = w.cpu().numpy()
+                einsum = np.einsum
             else:
-                w1 = w
-            nk, nl, nt = data.shape
-            data = w1 @ data.reshape(nk * nl, nt)
-            data = data.reshape(nk, nl, nt)
+                w1 = w.to(device=data.device, dtype=data.dtype)
+                einsum = torch.einsum
+
+            if data.ndim == 3:
+                nk_data, nl_data, nt_data = data.shape
+                if (nk_data, nl_data, nt_data) != (nk, nl, nt):
+                    raise ValueError(
+                        "Data shape "
+                        f"{tuple(data.shape)} does not match whitening shape {(nk, nl, nt)}."
+                    )
+                data = w1 @ data.reshape(nk * nl, nt)
+                data = data.reshape(nk, nl, nt)
+            elif data.ndim == 4:
+                batch_size, nk_data, nl_data, nt_data = data.shape
+                if (nk_data, nl_data, nt_data) != (nk, nl, nt):
+                    raise ValueError(
+                        "Batched data shape "
+                        f"{tuple(data.shape)} does not match whitening shape "
+                        f"(batch, {nk}, {nl}, {nt})."
+                    )
+                data = data.reshape(batch_size, nk * nl, nt)
+                data = einsum("ab,cbt->cat", w1, data)
+                data = data.reshape(batch_size, nk, nl, nt)
+            else:
+                raise ValueError(
+                    "ZCA whitening transformation expects data with shape "
+                    "(kernel, wavelength, time) or "
+                    "(batch, kernel, wavelength, time)."
+                )
 
             return data
 
